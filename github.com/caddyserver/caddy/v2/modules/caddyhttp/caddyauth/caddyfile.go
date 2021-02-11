@@ -15,8 +15,6 @@
 package caddyauth
 
 import (
-	"encoding/base64"
-
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
@@ -29,7 +27,7 @@ func init() {
 
 // parseCaddyfile sets up the handler from Caddyfile tokens. Syntax:
 //
-//     basicauth [<matcher>] [<hash_algorithm>] {
+//     basicauth [<matcher>] [<hash_algorithm> [<realm>]] {
 //         <username> <hashed_password_base64> [<salt_base64>]
 //         ...
 //     }
@@ -37,6 +35,7 @@ func init() {
 // If no hash algorithm is supplied, bcrypt will be assumed.
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var ba HTTPBasicAuth
+	ba.HashCache = new(Cache)
 
 	for h.Next() {
 		var cmp Comparer
@@ -48,6 +47,9 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			hashName = "bcrypt"
 		case 1:
 			hashName = args[0]
+		case 2:
+			hashName = args[0]
+			ba.Realm = args[1]
 		default:
 			return nil, h.ArgErr()
 		}
@@ -76,22 +78,10 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				return nil, h.Err("username and password cannot be empty or missing")
 			}
 
-			pwd, err := base64.StdEncoding.DecodeString(b64Pwd)
-			if err != nil {
-				return nil, h.Errf("decoding password: %v", err)
-			}
-			var salt []byte
-			if b64Salt != "" {
-				salt, err = base64.StdEncoding.DecodeString(b64Salt)
-				if err != nil {
-					return nil, h.Errf("decoding salt: %v", err)
-				}
-			}
-
 			ba.AccountList = append(ba.AccountList, Account{
 				Username: username,
-				Password: pwd,
-				Salt:     salt,
+				Password: b64Pwd,
+				Salt:     b64Salt,
 			})
 		}
 	}

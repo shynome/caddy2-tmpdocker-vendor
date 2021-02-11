@@ -50,11 +50,24 @@ func (BcryptHash) Compare(hashed, plaintext, _ []byte) (bool, error) {
 	return true, nil
 }
 
+// Hash hashes plaintext using a random salt.
+func (BcryptHash) Hash(plaintext, _ []byte) ([]byte, error) {
+	return bcrypt.GenerateFromPassword(plaintext, 14)
+}
+
 // ScryptHash implements the scrypt KDF as a hash.
 type ScryptHash struct {
-	N         int `json:"N,omitempty"`
-	R         int `json:"r,omitempty"`
-	P         int `json:"p,omitempty"`
+	// scrypt's N parameter. If unset or 0, a safe default is used.
+	N int `json:"N,omitempty"`
+
+	// scrypt's r parameter. If unset or 0, a safe default is used.
+	R int `json:"r,omitempty"`
+
+	// scrypt's p parameter. If unset or 0, a safe default is used.
+	P int `json:"p,omitempty"`
+
+	// scrypt's key length parameter (in bytes). If unset or 0, a
+	// safe default is used.
 	KeyLength int `json:"key_length,omitempty"`
 }
 
@@ -105,6 +118,11 @@ func (s ScryptHash) Compare(hashed, plaintext, salt []byte) (bool, error) {
 	return false, nil
 }
 
+// Hash hashes plaintext using the given salt.
+func (s ScryptHash) Hash(plaintext, salt []byte) ([]byte, error) {
+	return scrypt.Key(plaintext, salt, s.N, s.R, s.P, s.KeyLength)
+}
+
 func hashesMatch(pwdHash1, pwdHash2 []byte) bool {
 	return subtle.ConstantTimeCompare(pwdHash1, pwdHash2) == 1
 }
@@ -113,5 +131,7 @@ func hashesMatch(pwdHash1, pwdHash2 []byte) bool {
 var (
 	_ Comparer          = (*BcryptHash)(nil)
 	_ Comparer          = (*ScryptHash)(nil)
+	_ Hasher            = (*BcryptHash)(nil)
+	_ Hasher            = (*ScryptHash)(nil)
 	_ caddy.Provisioner = (*ScryptHash)(nil)
 )

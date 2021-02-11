@@ -18,56 +18,55 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
-	"github.com/go-acme/lego/v3/challenge/tlsalpn01"
-	"github.com/mholt/certmagic"
+	"github.com/mholt/acmez"
 )
 
-// ConnectionPolicies is an ordered group of connection policies;
-// the first matching policy will be used to configure TLS
-// connections at handshake-time.
+// ConnectionPolicies govern the establishment of TLS connections. It is
+// an ordered group of connection policies; the first matching policy will
+// be used to configure TLS connections at handshake-time.
 type ConnectionPolicies []*ConnectionPolicy
 
-// TLSConfig converts the group of policies to a standard-lib-compatible
-// TLS configuration which selects the first matching policy based on
-// the ClientHello.
-func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) (*tls.Config, error) {
-	// set up each of the connection policies
+// Provision sets up each connection policy. It should be called
+// during the Validate() phase, after the TLS app (if any) is
+// already set up.
+func (cp ConnectionPolicies) Provision(ctx caddy.Context) error {
 	for i, pol := range cp {
 		// matchers
 		mods, err := ctx.LoadModule(pol, "MatchersRaw")
 		if err != nil {
-			return nil, fmt.Errorf("loading handshake matchers: %v", err)
+			return fmt.Errorf("loading handshake matchers: %v", err)
 		}
 		for _, modIface := range mods.(map[string]interface{}) {
 			cp[i].matchers = append(cp[i].matchers, modIface.(ConnectionMatcher))
 		}
 
-		// certificate selector
-		if pol.CertSelection != nil {
-			val, err := ctx.LoadModule(pol, "CertSelection")
-			if err != nil {
-				return nil, fmt.Errorf("loading certificate selection module: %s", err)
-			}
-			cp[i].certSelector = val.(certmagic.CertificateSelector)
+		// enable HTTP/2 by default
+		if len(pol.ALPN) == 0 {
+			pol.ALPN = append(pol.ALPN, defaultALPN...)
 		}
-	}
 
-	// pre-build standard TLS configs so we don't have to at handshake-time
-	for i := range cp {
-		err := cp[i].buildStandardTLSConfig(ctx)
+		// pre-build standard TLS config so we don't have to at handshake-time
+		err = pol.buildStandardTLSConfig(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("connection policy %d: building standard TLS config: %s", i, err)
+			return fmt.Errorf("connection policy %d: building standard TLS config: %s", i, err)
 		}
 	}
 
+	return nil
+}
+
+// TLSConfig returns a standard-lib-compatible TLS configuration which
+// selects the first matching policy based on the ClientHello.
+func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) *tls.Config {
 	// using ServerName to match policies is extremely common, especially in configs
 	// with lots and lots of different policies; we can fast-track those by indexing
 	// them by SNI, so we don't have to iterate potentially thousands of policies
+	// (TODO: this map does not account for wildcards, see if this is a problem in practice? look for reports of high connection latency with wildcard certs but low latency for non-wildcards in multi-thousand-cert deployments)
 	indexedBySNI := make(map[string]ConnectionPolicies)
 	if len(cp) > 30 {
 		for _, p := range cp {
@@ -82,6 +81,7 @@ func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) (*tls.Config, error) {
 	}
 
 	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			// filter policies by SNI first, if possible, to speed things up
 			// when there may be lots of policies
@@ -102,10 +102,11 @@ func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) (*tls.Config, error) {
 
 			return nil, fmt.Errorf("no server TLS configuration available for ClientHello: %+v", hello)
 		},
-	}, nil
+	}
 }
 
 // ConnectionPolicy specifies the logic for handling a TLS handshake.
+// An empty policy is valid; safe and sensible defaults will be used.
 type ConnectionPolicy struct {
 	// How to match this policy with a TLS ClientHello. If
 	// this policy is the first to match, it will be used.
@@ -113,7 +114,7 @@ type ConnectionPolicy struct {
 
 	// How to choose a certificate if more than one matched
 	// the given ServerName (SNI) value.
-	CertSelection json.RawMessage `json:"certificate_selection,omitempty" caddy:"namespace=tls.certificate_selection inline_key=policy"`
+	CertSelection *CustomCertSelectionPolicy `json:"certificate_selection,omitempty"`
 
 	// The list of cipher suites to support. Caddy's
 	// defaults are modern and secure.
@@ -136,9 +137,11 @@ type ConnectionPolicy struct {
 	// Enables and configures TLS client authentication.
 	ClientAuthentication *ClientAuthentication `json:"client_authentication,omitempty"`
 
-	matchers     []ConnectionMatcher
-	certSelector certmagic.CertificateSelector
+	// DefaultSNI becomes the ServerName in a ClientHello if there
+	// is no policy configured for the empty SNI value.
+	DefaultSNI string `json:"default_sni,omitempty"`
 
+	matchers     []ConnectionMatcher
 	stdTLSConfig *tls.Config
 }
 
@@ -157,15 +160,29 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 		NextProtos:               p.ALPN,
 		PreferServerCipherSuites: true,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			cfgTpl, err := tlsApp.getConfigForName(hello.ServerName)
-			if err != nil {
-				return nil, fmt.Errorf("getting config for name %s: %v", hello.ServerName, err)
+			// TODO: I don't love how this works: we pre-build certmagic configs
+			// so that handshakes are faster. Unfortunately, certmagic configs are
+			// comprised of settings from both a TLS connection policy and a TLS
+			// automation policy. The only two fields (as of March 2020; v2 beta 17)
+			// of a certmagic config that come from the TLS connection policy are
+			// CertSelection and DefaultServerName, so an automation policy is what
+			// builds the base certmagic config. Since the pre-built config is
+			// shared, I don't think we can change any of its fields per-handshake,
+			// hence the awkward shallow copy (dereference) here and the subsequent
+			// changing of some of its fields. I'm worried this dereference allocates
+			// more at handshake-time, but I don't know how to practically pre-build
+			// a certmagic config for each combination of conn policy + automation policy...
+			cfg := *tlsApp.getConfigForName(hello.ServerName)
+			if p.CertSelection != nil {
+				// you would think we could just set this whether or not
+				// p.CertSelection is nil, but that leads to panics if
+				// it is, because cfg.CertSelection is an interface,
+				// so it will have a non-nil value even if the actual
+				// value underlying it is nil (sigh)
+				cfg.CertSelection = p.CertSelection
 			}
-			newCfg := certmagic.New(tlsApp.certCache, cfgTpl)
-			if p.certSelector != nil {
-				newCfg.CertSelection = p.certSelector
-			}
-			return newCfg.GetCertificate(hello)
+			cfg.DefaultServerName = p.DefaultSNI
+			return cfg.GetCertificate(hello)
 		},
 		MinVersion: tls.VersionTLS12,
 		MaxVersion: tls.VersionTLS13,
@@ -178,7 +195,7 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 		// session ticket key rotation
 		tlsApp.SessionTickets.register(cfg)
 		ctx.OnCancel(func() {
-			// do cleanup when the context is cancelled because,
+			// do cleanup when the context is canceled because,
 			// though unlikely, it is possible that a context
 			// needing a TLS server config could exist for less
 			// than the lifetime of the whole app
@@ -191,7 +208,10 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 	// add all the cipher suites in order, without duplicates
 	cipherSuitesAdded := make(map[uint16]struct{})
 	for _, csName := range p.CipherSuites {
-		csID := SupportedCipherSuites[csName]
+		csID := CipherSuiteID(csName)
+		if csID == 0 {
+			return fmt.Errorf("unsupported cipher suite: %s", csName)
+		}
 		if _, ok := cipherSuitesAdded[csID]; !ok {
 			cipherSuitesAdded[csID] = struct{}{}
 			cfg.CipherSuites = append(cfg.CipherSuites, csID)
@@ -211,24 +231,24 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 	// ensure ALPN includes the ACME TLS-ALPN protocol
 	var alpnFound bool
 	for _, a := range p.ALPN {
-		if a == tlsalpn01.ACMETLS1Protocol {
+		if a == acmez.ACMETLS1Protocol {
 			alpnFound = true
 			break
 		}
 	}
 	if !alpnFound {
-		cfg.NextProtos = append(cfg.NextProtos, tlsalpn01.ACMETLS1Protocol)
+		cfg.NextProtos = append(cfg.NextProtos, acmez.ACMETLS1Protocol)
 	}
 
 	// min and max protocol versions
+	if (p.ProtocolMin != "" && p.ProtocolMax != "") && p.ProtocolMin > p.ProtocolMax {
+		return fmt.Errorf("protocol min (%x) cannot be greater than protocol max (%x)", p.ProtocolMin, p.ProtocolMax)
+	}
 	if p.ProtocolMin != "" {
 		cfg.MinVersion = SupportedProtocols[p.ProtocolMin]
 	}
 	if p.ProtocolMax != "" {
 		cfg.MaxVersion = SupportedProtocols[p.ProtocolMax]
-	}
-	if p.ProtocolMin > p.ProtocolMax {
-		return fmt.Errorf("protocol min (%x) cannot be greater than protocol max (%x)", p.ProtocolMin, p.ProtocolMax)
 	}
 
 	// client authentication
@@ -239,13 +259,24 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 		}
 	}
 
-	// TODO: other fields
-
 	setDefaultTLSParams(cfg)
 
 	p.stdTLSConfig = cfg
 
 	return nil
+}
+
+// SettingsEmpty returns true if p's settings (fields
+// except the matchers) are all empty/unset.
+func (p ConnectionPolicy) SettingsEmpty() bool {
+	return p.CertSelection == nil &&
+		p.CipherSuites == nil &&
+		p.Curves == nil &&
+		p.ALPN == nil &&
+		p.ProtocolMin == "" &&
+		p.ProtocolMax == "" &&
+		p.ClientAuthentication == nil &&
+		p.DefaultSNI == ""
 }
 
 // ClientAuthentication configures TLS client auth.
@@ -256,10 +287,30 @@ type ClientAuthentication struct {
 	// these CAs will be rejected.
 	TrustedCACerts []string `json:"trusted_ca_certs,omitempty"`
 
+	// TrustedCACertPEMFiles is a list of PEM file names
+	// from which to load certificates of trusted CAs.
+	// Client certificates which are not signed by any of
+	// these CA certificates will be rejected.
+	TrustedCACertPEMFiles []string `json:"trusted_ca_certs_pem_files,omitempty"`
+
 	// A list of base64 DER-encoded client leaf certs
 	// to accept. If this list is not empty, client certs
 	// which are not in this list will be rejected.
 	TrustedLeafCerts []string `json:"trusted_leaf_certs,omitempty"`
+
+	// The mode for authenticating the client. Allowed values are:
+	//
+	// Mode | Description
+	// -----|---------------
+	// `request` | Ask clients for a certificate, but allow even if there isn't one; do not verify it
+	// `require` | Require clients to present a certificate, but do not verify it
+	// `verify_if_given` | Ask clients for a certificate; allow even if there isn't one, but verify it if there is
+	// `require_and_verify` | Require clients to present a valid certificate that is verified
+	//
+	// The default mode is `require_and_verify` if any
+	// TrustedCACerts or TrustedCACertPEMFiles or TrustedLeafCerts
+	// are provided; otherwise, the default mode is `require`.
+	Mode string `json:"mode,omitempty"`
 
 	// state established with the last call to ConfigureTLSConfig
 	trustedLeafCerts       []*x509.Certificate
@@ -268,7 +319,10 @@ type ClientAuthentication struct {
 
 // Active returns true if clientauth has an actionable configuration.
 func (clientauth ClientAuthentication) Active() bool {
-	return len(clientauth.TrustedCACerts) > 0 || len(clientauth.TrustedLeafCerts) > 0
+	return len(clientauth.TrustedCACerts) > 0 ||
+		len(clientauth.TrustedCACertPEMFiles) > 0 ||
+		len(clientauth.TrustedLeafCerts) > 0 ||
+		len(clientauth.Mode) > 0
 }
 
 // ConfigureTLSConfig sets up cfg to enforce clientauth's configuration.
@@ -279,11 +333,33 @@ func (clientauth *ClientAuthentication) ConfigureTLSConfig(cfg *tls.Config) erro
 		return nil
 	}
 
-	// otherwise, at least require any client certificate
-	cfg.ClientAuth = tls.RequireAnyClientCert
+	// enforce desired mode of client authentication
+	if len(clientauth.Mode) > 0 {
+		switch clientauth.Mode {
+		case "request":
+			cfg.ClientAuth = tls.RequestClientCert
+		case "require":
+			cfg.ClientAuth = tls.RequireAnyClientCert
+		case "verify_if_given":
+			cfg.ClientAuth = tls.VerifyClientCertIfGiven
+		case "require_and_verify":
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		default:
+			return fmt.Errorf("client auth mode not recognized: %s", clientauth.Mode)
+		}
+	} else {
+		// otherwise, set a safe default mode
+		if len(clientauth.TrustedCACerts) > 0 ||
+			len(clientauth.TrustedCACertPEMFiles) > 0 ||
+			len(clientauth.TrustedLeafCerts) > 0 {
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			cfg.ClientAuth = tls.RequireAnyClientCert
+		}
+	}
 
 	// enforce CA verification by adding CA certs to the ClientCAs pool
-	if len(clientauth.TrustedCACerts) > 0 {
+	if len(clientauth.TrustedCACerts) > 0 || len(clientauth.TrustedCACertPEMFiles) > 0 {
 		caPool := x509.NewCertPool()
 		for _, clientCAString := range clientauth.TrustedCACerts {
 			clientCA, err := decodeBase64DERCert(clientCAString)
@@ -292,16 +368,19 @@ func (clientauth *ClientAuthentication) ConfigureTLSConfig(cfg *tls.Config) erro
 			}
 			caPool.AddCert(clientCA)
 		}
+		for _, pemFile := range clientauth.TrustedCACertPEMFiles {
+			pemContents, err := ioutil.ReadFile(pemFile)
+			if err != nil {
+				return fmt.Errorf("reading %s: %v", pemFile, err)
+			}
+			caPool.AppendCertsFromPEM(pemContents)
+		}
 		cfg.ClientCAs = caPool
-
-		// now ensure the standard lib will verify client certificates
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
 	}
 
 	// enforce leaf verification by writing our own verify function
 	if len(clientauth.TrustedLeafCerts) > 0 {
 		clientauth.trustedLeafCerts = []*x509.Certificate{}
-
 		for _, clientCertString := range clientauth.TrustedLeafCerts {
 			clientCert, err := decodeBase64DERCert(clientCertString)
 			if err != nil {
@@ -309,10 +388,8 @@ func (clientauth *ClientAuthentication) ConfigureTLSConfig(cfg *tls.Config) erro
 			}
 			clientauth.trustedLeafCerts = append(clientauth.trustedLeafCerts, clientCert)
 		}
-
 		// if a custom verification function already exists, wrap it
 		clientauth.existingVerifyPeerCert = cfg.VerifyPeerCertificate
-
 		cfg.VerifyPeerCertificate = clientauth.verifyPeerCertificate
 	}
 
@@ -335,7 +412,7 @@ func (clientauth ClientAuthentication) verifyPeerCertificate(rawCerts [][]byte, 
 		return fmt.Errorf("no client certificate provided")
 	}
 
-	remoteLeafCert, err := x509.ParseCertificate(rawCerts[len(rawCerts)-1])
+	remoteLeafCert, err := x509.ParseCertificate(rawCerts[0])
 	if err != nil {
 		return fmt.Errorf("can't parse the given certificate: %s", err.Error())
 	}
@@ -351,13 +428,10 @@ func (clientauth ClientAuthentication) verifyPeerCertificate(rawCerts [][]byte, 
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
 func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
-	// decode base64
 	derBytes, err := base64.StdEncoding.DecodeString(certStr)
 	if err != nil {
 		return nil, err
 	}
-
-	// parse the DER-encoded certificate
 	return x509.ParseCertificate(derBytes)
 }
 
@@ -406,3 +480,5 @@ func (a *PublicKeyAlgorithm) UnmarshalJSON(b []byte) error {
 type ConnectionMatcher interface {
 	Match(*tls.ClientHelloInfo) bool
 }
+
+var defaultALPN = []string{"h2", "http/1.1"}

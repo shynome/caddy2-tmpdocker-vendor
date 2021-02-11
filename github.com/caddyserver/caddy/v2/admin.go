@@ -18,10 +18,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"io"
-	"mime"
+	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -33,7 +35,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/caddyconfig"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -50,7 +52,7 @@ type AdminConfig struct {
 
 	// The address to which the admin endpoint's listener should
 	// bind itself. Can be any single network address that can be
-	// parsed by Caddy.
+	// parsed by Caddy. Default: localhost:2019
 	Listen string `json:"listen,omitempty"`
 
 	// If true, CORS headers will be emitted, and requests to the
@@ -61,68 +63,98 @@ type AdminConfig struct {
 	// default.
 	EnforceOrigin bool `json:"enforce_origin,omitempty"`
 
-	// The list of allowed origins for API requests. Only used if
-	// `enforce_origin` is true. If not set, the listener address
-	// will be the default value. If set but empty, no origins will
-	// be allowed.
+	// The list of allowed origins/hosts for API requests. Only needed
+	// if accessing the admin endpoint from a host different from the
+	// socket's network interface or if `enforce_origin` is true. If not
+	// set, the listener address will be the default value. If set but
+	// empty, no origins will be allowed.
 	Origins []string `json:"origins,omitempty"`
+
+	// Options related to configuration management.
+	Config *ConfigSettings `json:"config,omitempty"`
+}
+
+// ConfigSettings configures the, uh, configuration... and
+// management thereof.
+type ConfigSettings struct {
+	// Whether to keep a copy of the active config on disk. Default is true.
+	Persist *bool `json:"persist,omitempty"`
 }
 
 // listenAddr extracts a singular listen address from ac.Listen,
 // returning the network and the address of the listener.
-func (admin AdminConfig) listenAddr() (string, string, error) {
+func (admin AdminConfig) listenAddr() (NetworkAddress, error) {
 	input := admin.Listen
 	if input == "" {
 		input = DefaultAdminListen
 	}
 	listenAddr, err := ParseNetworkAddress(input)
 	if err != nil {
-		return "", "", fmt.Errorf("parsing admin listener address: %v", err)
+		return NetworkAddress{}, fmt.Errorf("parsing admin listener address: %v", err)
 	}
 	if listenAddr.PortRangeSize() != 1 {
-		return "", "", fmt.Errorf("admin endpoint must have exactly one address; cannot listen on %v", listenAddr)
+		return NetworkAddress{}, fmt.Errorf("admin endpoint must have exactly one address; cannot listen on %v", listenAddr)
 	}
-	return listenAddr.Network, listenAddr.JoinHostPort(0), nil
+	return listenAddr, nil
 }
 
 // newAdminHandler reads admin's config and returns an http.Handler suitable
 // for use in an admin endpoint server, which will be listening on listenAddr.
-func (admin AdminConfig) newAdminHandler(listenAddr string) adminHandler {
+func (admin AdminConfig) newAdminHandler(addr NetworkAddress) adminHandler {
 	muxWrap := adminHandler{
 		enforceOrigin:  admin.EnforceOrigin,
-		allowedOrigins: admin.allowedOrigins(listenAddr),
+		enforceHost:    !addr.isWildcardInterface(),
+		allowedOrigins: admin.allowedOrigins(addr),
 		mux:            http.NewServeMux(),
 	}
 
+	addRouteWithMetrics := func(pattern string, handlerLabel string, h http.Handler) {
+		labels := prometheus.Labels{"path": pattern, "handler": handlerLabel}
+		h = instrumentHandlerCounter(
+			adminMetrics.requestCount.MustCurryWith(labels),
+			h,
+		)
+		muxWrap.mux.Handle(pattern, h)
+	}
 	// addRoute just calls muxWrap.mux.Handle after
 	// wrapping the handler with error handling
-	addRoute := func(pattern string, h AdminHandler) {
+	addRoute := func(pattern string, handlerLabel string, h AdminHandler) {
 		wrapper := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			err := h.ServeHTTP(w, r)
+			if err != nil {
+				labels := prometheus.Labels{
+					"path":    pattern,
+					"handler": handlerLabel,
+					"method":  strings.ToUpper(r.Method),
+				}
+				adminMetrics.requestErrors.With(labels).Inc()
+			}
 			muxWrap.handleError(w, r, err)
 		})
-		muxWrap.mux.Handle(pattern, wrapper)
+		addRouteWithMetrics(pattern, handlerLabel, wrapper)
 	}
 
+	const handlerLabel = "admin"
+
 	// register standard config control endpoints
-	addRoute("/load", AdminHandlerFunc(handleLoad))
-	addRoute("/"+rawConfigKey+"/", AdminHandlerFunc(handleConfig))
-	addRoute("/id/", AdminHandlerFunc(handleConfigID))
-	addRoute("/stop", AdminHandlerFunc(handleStop))
+	addRoute("/"+rawConfigKey+"/", handlerLabel, AdminHandlerFunc(handleConfig))
+	addRoute("/id/", handlerLabel, AdminHandlerFunc(handleConfigID))
+	addRoute("/stop", handlerLabel, AdminHandlerFunc(handleStop))
 
 	// register debugging endpoints
-	muxWrap.mux.HandleFunc("/debug/pprof/", pprof.Index)
-	muxWrap.mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	muxWrap.mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	muxWrap.mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	muxWrap.mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	muxWrap.mux.Handle("/debug/vars", expvar.Handler())
+	addRouteWithMetrics("/debug/pprof/", handlerLabel, http.HandlerFunc(pprof.Index))
+	addRouteWithMetrics("/debug/pprof/cmdline", handlerLabel, http.HandlerFunc(pprof.Cmdline))
+	addRouteWithMetrics("/debug/pprof/profile", handlerLabel, http.HandlerFunc(pprof.Profile))
+	addRouteWithMetrics("/debug/pprof/symbol", handlerLabel, http.HandlerFunc(pprof.Symbol))
+	addRouteWithMetrics("/debug/pprof/trace", handlerLabel, http.HandlerFunc(pprof.Trace))
+	addRouteWithMetrics("/debug/vars", handlerLabel, expvar.Handler())
 
 	// register third-party module endpoints
 	for _, m := range GetModules("admin.api") {
 		router := m.New().(AdminRouter)
+		handlerLabel := m.ID.Name()
 		for _, route := range router.Routes() {
-			addRoute(route.Pattern, route.Handler)
+			addRoute(route.Pattern, handlerLabel, route.Handler)
 		}
 	}
 
@@ -133,16 +165,32 @@ func (admin AdminConfig) newAdminHandler(listenAddr string) adminHandler {
 // If admin.Origins is nil (null), the provided listen address
 // will be used as the default origin. If admin.Origins is
 // empty, no origins will be allowed, effectively bricking the
-// endpoint, but whatever.
-func (admin AdminConfig) allowedOrigins(listen string) []string {
+// endpoint for non-unix-socket endpoints, but whatever.
+func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []string {
 	uniqueOrigins := make(map[string]struct{})
 	for _, o := range admin.Origins {
 		uniqueOrigins[o] = struct{}{}
 	}
 	if admin.Origins == nil {
-		uniqueOrigins[listen] = struct{}{}
+		if addr.isLoopback() {
+			if addr.IsUnixNetwork() {
+				// RFC 2616, Section 14.26:
+				// "A client MUST include a Host header field in all HTTP/1.1 request
+				// messages. If the requested URI does not include an Internet host
+				// name for the service being requested, then the Host header field MUST
+				// be given with an empty value."
+				uniqueOrigins[""] = struct{}{}
+			} else {
+				uniqueOrigins[net.JoinHostPort("localhost", addr.port())] = struct{}{}
+				uniqueOrigins[net.JoinHostPort("::1", addr.port())] = struct{}{}
+				uniqueOrigins[net.JoinHostPort("127.0.0.1", addr.port())] = struct{}{}
+			}
+		}
+		if !addr.IsUnixNetwork() {
+			uniqueOrigins[addr.JoinHostPort(0)] = struct{}{}
+		}
 	}
-	var allowed []string
+	allowed := make([]string, 0, len(uniqueOrigins))
 	for origin := range uniqueOrigins {
 		allowed = append(allowed, origin)
 	}
@@ -188,14 +236,14 @@ func replaceAdmin(cfg *Config) error {
 	}
 
 	// extract a singular listener address
-	netw, addr, err := adminConfig.listenAddr()
+	addr, err := adminConfig.listenAddr()
 	if err != nil {
 		return err
 	}
 
 	handler := adminConfig.newAdminHandler(addr)
 
-	ln, err := Listen(netw, addr)
+	ln, err := Listen(addr.Network, addr.JoinHostPort(0))
 	if err != nil {
 		return err
 	}
@@ -208,14 +256,22 @@ func replaceAdmin(cfg *Config) error {
 		MaxHeaderBytes:    1024 * 64,
 	}
 
-	go adminServer.Serve(ln)
+	adminLogger := Log().Named("admin")
+	go func() {
+		if err := adminServer.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			adminLogger.Error("admin server shutdown for unknown reason", zap.Error(err))
+		}
+	}()
 
-	Log().Named("admin").Info(
-		"admin endpoint started",
-		zap.String("address", addr),
+	adminLogger.Info("admin endpoint started",
+		zap.String("address", addr.String()),
 		zap.Bool("enforce_origin", adminConfig.EnforceOrigin),
-		zap.Strings("origins", handler.allowedOrigins),
-	)
+		zap.Strings("origins", handler.allowedOrigins))
+
+	if !handler.enforceHost {
+		adminLogger.Warn("admin endpoint on open interface; host checking disabled",
+			zap.String("address", addr.String()))
+	}
 
 	return nil
 }
@@ -247,6 +303,7 @@ type AdminRoute struct {
 
 type adminHandler struct {
 	enforceOrigin  bool
+	enforceHost    bool
 	allowedOrigins []string
 	mux            *http.ServeMux
 }
@@ -254,12 +311,18 @@ type adminHandler struct {
 // ServeHTTP is the external entry point for API requests.
 // It will only be called once per request.
 func (h adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	Log().Named("admin.api").Info("received request",
+	log := Log().Named("admin.api").With(
 		zap.String("method", r.Method),
+		zap.String("host", r.Host),
 		zap.String("uri", r.RequestURI),
 		zap.String("remote_addr", r.RemoteAddr),
 		zap.Reflect("headers", r.Header),
 	)
+	if r.RequestURI == "/metrics" {
+		log.Debug("received request")
+	} else {
+		log.Info("received request")
+	}
 	h.serveHTTP(w, r)
 }
 
@@ -267,14 +330,24 @@ func (h adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // be called more than once per request, for example if a request
 // is rewritten (i.e. internal redirect).
 func (h adminHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.enforceOrigin {
+	if strings.Contains(r.Header.Get("Upgrade"), "websocket") {
+		// I've never been able demonstrate a vulnerability myself, but apparently
+		// WebSocket connections originating from browsers aren't subject to CORS
+		// restrictions, so we'll just be on the safe side
+		h.handleError(w, r, fmt.Errorf("websocket connections aren't allowed"))
+		return
+	}
+
+	if h.enforceHost {
 		// DNS rebinding mitigation
 		err := h.checkHost(r)
 		if err != nil {
 			h.handleError(w, r, err)
 			return
 		}
+	}
 
+	if h.enforceOrigin {
 		// cross-site mitigation
 		origin, err := h.checkOrigin(r)
 		if err != nil {
@@ -282,10 +355,12 @@ func (h adminHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PUT, PATCH, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PUT, PATCH, DELETE")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 
 	// TODO: authentication & authorization, if configured
@@ -323,7 +398,10 @@ func (h adminHandler) handleError(w http.ResponseWriter, r *http.Request, err er
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(apiErr.Code)
-	json.NewEncoder(w).Encode(apiErr)
+	encErr := json.NewEncoder(w).Encode(apiErr)
+	if encErr != nil {
+		Log().Named("admin.api").Error("failed to encode error response", zap.Error(encErr))
+	}
 }
 
 // checkHost returns a handler that wraps next such that
@@ -393,86 +471,6 @@ func (h adminHandler) originAllowed(origin string) bool {
 		}
 	}
 	return false
-}
-
-func handleLoad(w http.ResponseWriter, r *http.Request) error {
-	if r.Method != http.MethodPost {
-		return APIError{
-			Code: http.StatusMethodNotAllowed,
-			Err:  fmt.Errorf("method not allowed"),
-		}
-	}
-
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer bufPool.Put(buf)
-
-	_, err := io.Copy(buf, r.Body)
-	if err != nil {
-		return APIError{
-			Code: http.StatusBadRequest,
-			Err:  fmt.Errorf("reading request body: %v", err),
-		}
-	}
-	body := buf.Bytes()
-
-	// if the config is formatted other than Caddy's native
-	// JSON, we need to adapt it before loading it
-	if ctHeader := r.Header.Get("Content-Type"); ctHeader != "" {
-		ct, _, err := mime.ParseMediaType(ctHeader)
-		if err != nil {
-			return APIError{
-				Code: http.StatusBadRequest,
-				Err:  fmt.Errorf("invalid Content-Type: %v", err),
-			}
-		}
-		if !strings.HasSuffix(ct, "/json") {
-			slashIdx := strings.Index(ct, "/")
-			if slashIdx < 0 {
-				return APIError{
-					Code: http.StatusBadRequest,
-					Err:  fmt.Errorf("malformed Content-Type"),
-				}
-			}
-			adapterName := ct[slashIdx+1:]
-			cfgAdapter := caddyconfig.GetAdapter(adapterName)
-			if cfgAdapter == nil {
-				return APIError{
-					Code: http.StatusBadRequest,
-					Err:  fmt.Errorf("unrecognized config adapter '%s'", adapterName),
-				}
-			}
-			result, warnings, err := cfgAdapter.Adapt(body, nil)
-			if err != nil {
-				return APIError{
-					Code: http.StatusBadRequest,
-					Err:  fmt.Errorf("adapting config using %s adapter: %v", adapterName, err),
-				}
-			}
-			if len(warnings) > 0 {
-				respBody, err := json.Marshal(warnings)
-				if err != nil {
-					Log().Named("admin.api.load").Error(err.Error())
-				}
-				w.Write(respBody)
-			}
-			body = result
-		}
-	}
-
-	forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
-
-	err = Load(body, forceReload)
-	if err != nil {
-		return APIError{
-			Code: http.StatusBadRequest,
-			Err:  fmt.Errorf("loading config: %v", err),
-		}
-	}
-
-	Log().Named("admin.api").Info("load complete")
-
-	return nil
 }
 
 func handleConfig(w http.ResponseWriter, r *http.Request) error {
@@ -565,16 +563,19 @@ func handleStop(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		Log().Named("admin.api").Error("unload error", zap.Error(err))
 	}
-	go func() {
-		err := stopAdminServer(adminServer)
-		var exitCode int
-		if err != nil {
-			exitCode = ExitCodeFailedQuit
-			Log().Named("admin.api").Error("failed to stop admin server gracefully", zap.Error(err))
-		}
-		Log().Named("admin.api").Info("stopping now, bye!! 👋")
-		os.Exit(exitCode)
-	}()
+	if adminServer != nil {
+		// use goroutine so that we can finish responding to API request
+		go func() {
+			err := stopAdminServer(adminServer)
+			var exitCode int
+			if err != nil {
+				exitCode = ExitCodeFailedQuit
+				Log().Named("admin.api").Error("failed to stop admin server gracefully", zap.Error(err))
+			}
+			Log().Named("admin.api").Info("stopping now, bye!! 👋")
+			os.Exit(exitCode)
+		}()
+	}
 	return nil
 }
 
@@ -587,13 +588,6 @@ func handleUnload(w http.ResponseWriter, r *http.Request) error {
 			Code: http.StatusMethodNotAllowed,
 			Err:  fmt.Errorf("method not allowed"),
 		}
-	}
-	currentCfgMu.RLock()
-	hasCfg := currentCfg != nil
-	currentCfgMu.RUnlock()
-	if !hasCfg {
-		Log().Named("admin.api").Info("nothing to unload")
-		return nil
 	}
 	Log().Named("admin.api").Info("unloading")
 	if err := stopAndCleanup(); err != nil {
@@ -773,7 +767,11 @@ traverseLoop:
 	return nil
 }
 
-// RemoveMetaFields removes meta fields like "@id" from a JSON message.
+// RemoveMetaFields removes meta fields like "@id" from a JSON message
+// by using a simple regular expression. (An alternate way to do this
+// would be to delete them from the raw, map[string]interface{}
+// representation as they are indexed, then iterate the index we made
+// and add them back after encoding as JSON, but this is simpler.)
 func RemoveMetaFields(rawJSON []byte) []byte {
 	return idRegexp.ReplaceAllFunc(rawJSON, func(in []byte) []byte {
 		// matches with a comma on both sides (when "@id" property is
@@ -839,11 +837,26 @@ var (
 	}
 )
 
+// PIDFile writes a pidfile to the file at filename. It
+// will get deleted before the process gracefully exits.
+func PIDFile(filename string) error {
+	pid := []byte(strconv.Itoa(os.Getpid()) + "\n")
+	err := ioutil.WriteFile(filename, pid, 0600)
+	if err != nil {
+		return err
+	}
+	pidfile = filename
+	return nil
+}
+
 // idRegexp is used to match ID fields and their associated values
 // in the config. It also matches adjacent commas so that syntax
 // can be preserved no matter where in the object the field appears.
 // It supports string and most numeric values.
-var idRegexp = regexp.MustCompile(`(?m),?\s*"` + idKey + `":\s?(-?[0-9]+(\.[0-9]+)?|(?U)".*")\s*,?`)
+var idRegexp = regexp.MustCompile(`(?m),?\s*"` + idKey + `"\s*:\s*(-?[0-9]+(\.[0-9]+)?|(?U)".*")\s*,?`)
+
+// pidfile is the name of the pidfile, if any.
+var pidfile string
 
 const (
 	rawConfigKey = "config"

@@ -16,11 +16,12 @@ package caddyhttp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
+	"runtime"
 	"strings"
 	"time"
 
@@ -33,40 +34,16 @@ import (
 
 // Server describes an HTTP server.
 type Server struct {
-	// Socket interfaces to which to bind listeners. Caddy network
-	// addresses have the following form:
-	//
-	//     network/address
-	//
-	// The network part is anything that [Go's `net` package](https://golang.org/pkg/net/)
-	// recognizes, and is optional. The default network is `tcp`. If
-	// a network is specified, a single forward slash `/` is used to
-	// separate the network and address portions.
-	//
-	// The address part may be any of these forms:
-	//
-	//    - `host`
-	//    - `host:port`
-	//    - `:port`
-	//    - `/path/to/unix/socket`
-	//
-	// The host may be any hostname, resolvable domain name, or IP address.
-	// The port may be a single value (`:8080`) or a range (`:8080-8085`).
-	// A port range will be multiplied into singular addresses. Not all
-	// config parameters accept port ranges, but Listen does.
-	//
-	// Valid examples:
-	//
-	//     :8080
-	//     127.0.0.1:8080
-	//     localhost:8080
-	//     localhost:8080-8085
-	//     tcp/localhost:8080
-	//     tcp/localhost:8080-8085
-	//     udp/localhost:9005
-	//     unix//path/to/socket
-	//
+	// Socket addresses to which to bind listeners. Accepts
+	// [network addresses](/docs/conventions#network-addresses)
+	// that may include port ranges. Listener addresses must
+	// be unique; they cannot be repeated across all defined
+	// servers.
 	Listen []string `json:"listen,omitempty"`
+
+	// A list of listener wrapper modules, which can modify the behavior
+	// of the base listener. They are applied in the given order.
+	ListenerWrappersRaw []json.RawMessage `json:"listener_wrappers,omitempty" caddy:"namespace=caddy.listeners inline_key=wrapper"`
 
 	// How long to allow a read from a client's upload. Setting this
 	// to a short, non-zero value can mitigate slowloris attacks, but
@@ -82,8 +59,8 @@ type Server struct {
 	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
 
 	// IdleTimeout is the maximum time to wait for the next request
-	// when keep-alives are enabled. If zero, ReadTimeout is used.
-	// If both are zero, there is no timeout.
+	// when keep-alives are enabled. If zero, a default timeout of
+	// 5m is applied to help avoid resource exhaustion.
 	IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 
 	// MaxHeaderBytes is the maximum size to parse from a client's
@@ -91,28 +68,35 @@ type Server struct {
 	MaxHeaderBytes int `json:"max_header_bytes,omitempty"`
 
 	// Routes describes how this server will handle requests.
-	// When a request comes in, each route's matchers will
-	// be evaluated against the request, and matching routes
-	// will be compiled into a middleware chain in the order
-	// in which they appear in the list.
+	// Routes are executed sequentially. First a route's matchers
+	// are evaluated, then its grouping. If it matches and has
+	// not been mutually-excluded by its grouping, then its
+	// handlers are executed sequentially. The sequence of invoked
+	// handlers comprises a compiled middleware chain that flows
+	// from each matching route and its handlers to the next.
+	//
+	// By default, all unrouted requests receive a 200 OK response
+	// to indicate the server is working.
 	Routes RouteList `json:"routes,omitempty"`
 
-	// Errors is how this server will handle errors returned from
-	// any of the handlers in the primary routes.
+	// Errors is how this server will handle errors returned from any
+	// of the handlers in the primary routes. If the primary handler
+	// chain returns an error, the error along with its recommended
+	// status code are bubbled back up to the HTTP server which
+	// executes a separate error route, specified using this property.
+	// The error routes work exactly like the normal routes.
 	Errors *HTTPErrorConfig `json:"errors,omitempty"`
 
-	// How to handle TLS connections.
+	// How to handle TLS connections. At least one policy is
+	// required to enable HTTPS on this server if automatic
+	// HTTPS is disabled or does not apply.
 	TLSConnPolicies caddytls.ConnectionPolicies `json:"tls_connection_policies,omitempty"`
 
 	// AutoHTTPS configures or disables automatic HTTPS within this server.
 	// HTTPS is enabled automatically and by default when qualifying names
-	// are present in a Host matcher.
+	// are present in a Host matcher and/or when the server is listening
+	// only on the HTTPS port.
 	AutoHTTPS *AutoHTTPSConfig `json:"automatic_https,omitempty"`
-
-	// MaxRehandles is the maximum number of times to allow a
-	// request to be rehandled, to prevent accidental infinite
-	// loops. Default: 1.
-	MaxRehandles *int `json:"max_rehandles,omitempty"`
 
 	// If true, will require that a request's Host header match
 	// the value of the ServerName sent by the client's TLS
@@ -120,13 +104,32 @@ type Server struct {
 	// client authentication.
 	StrictSNIHost *bool `json:"strict_sni_host,omitempty"`
 
-	// Logs customizes how access logs are handled in this server.
+	// Enables access logging and configures how access logs are handled
+	// in this server. To minimally enable access logs, simply set this
+	// to a non-null, empty struct.
 	Logs *ServerLogConfig `json:"logs,omitempty"`
 
 	// Enable experimental HTTP/3 support. Note that HTTP/3 is not a
 	// finished standard and has extremely limited client support.
 	// This field is not subject to compatibility promises.
 	ExperimentalHTTP3 bool `json:"experimental_http3,omitempty"`
+
+	// Enables H2C ("Cleartext HTTP/2" or "H2 over TCP") support,
+	// which will serve HTTP/2 over plaintext TCP connections if
+	// a client support it. Because this is not implemented by the
+	// Go standard library, using H2C is incompatible with most
+	// of the other options for this server. Do not enable this
+	// only to achieve maximum client compatibility. In practice,
+	// very few clients implement H2C, and even fewer require it.
+	// This setting applies only to unencrypted HTTP listeners.
+	// ⚠️ Experimental feature; subject to change or removal.
+	AllowH2C bool `json:"allow_h2c,omitempty"`
+
+	name string
+
+	primaryHandlerChain Handler
+	errorHandlerChain   Handler
+	listenerWrappers    []caddy.ListenerWrapper
 
 	tlsApp       *caddytls.TLS
 	logger       *zap.Logger
@@ -147,46 +150,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// set up the context for the request
 	repl := caddy.NewReplacer()
-	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
-	ctx = context.WithValue(ctx, ServerCtxKey, s)
-	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]interface{}))
-	var url2 url.URL // avoid letting this escape to the heap
-	ctx = context.WithValue(ctx, OriginalRequestCtxKey, originalRequest(r, &url2))
-	r = r.WithContext(ctx)
+	r = PrepareRequest(r, repl, w, s)
 
-	// once the pointer to the request won't change
-	// anymore, finish setting up the replacer
-	addHTTPVarsToReplacer(repl, r, w)
+	// encode the request for logging purposes before
+	// it enters any handler chain; this is necessary
+	// to capture the original request in case it gets
+	// modified during handling
+	loggableReq := zap.Object("request", LoggableHTTPRequest{r})
+	errLog := s.errorLogger.With(loggableReq)
 
-	loggableReq := LoggableHTTPRequest{r}
-	errLog := s.errorLogger.With(
-		// encode the request for logging purposes before
-		// it enters any handler chain; this is necessary
-		// to capture the original request in case it gets
-		// modified during handling
-		zap.Object("request", loggableReq),
-	)
+	var duration time.Duration
 
-	if s.accessLogger != nil {
+	if s.shouldLogRequest(r) {
 		wrec := NewResponseRecorder(w, nil, nil)
 		w = wrec
-		accLog := s.accessLogger.With(
-			// capture the original version of the request
-			zap.Object("request", loggableReq),
-		)
-		start := time.Now()
-		defer func() {
-			latency := time.Since(start)
 
-			repl.Set("http.response.status", strconv.Itoa(wrec.Status()))
-			repl.Set("http.response.size", strconv.Itoa(wrec.Size()))
-			repl.Set("http.response.latency", latency.String())
+		// capture the original version of the request
+		accLog := s.accessLogger.With(loggableReq)
+
+		defer func() {
+			repl.Set("http.response.status", wrec.Status())
+			repl.Set("http.response.size", wrec.Size())
+			repl.Set("http.response.duration", duration)
 
 			logger := accLog
-			if s.Logs != nil && s.Logs.LoggerNames != nil {
-				logger = logger.Named(s.Logs.LoggerNames[r.Host])
+			if s.Logs != nil {
+				logger = s.Logs.wrapLogger(logger, r.Host)
 			}
 
 			log := logger.Info
@@ -195,8 +185,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 
 			log("handled request",
-				zap.String("common_log", repl.ReplaceAll(CommonLogFormat, "-")),
-				zap.Duration("latency", latency),
+				zap.String("common_log", repl.ReplaceAll(commonLogFormat, commonLogEmptyValue)),
+				zap.Duration("duration", duration),
 				zap.Int("size", wrec.Size()),
 				zap.Int("status", wrec.Status()),
 				zap.Object("resp_headers", LoggableHTTPHeader(wrec.Header())),
@@ -204,85 +194,74 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
+	start := time.Now()
+
 	// guarantee ACME HTTP challenges; handle them
 	// separately from any user-defined handlers
 	if s.tlsApp.HandleHTTPChallenge(w, r) {
+		duration = time.Since(start)
 		return
 	}
 
-	// build and execute the primary handler chain
-	err := s.executeCompositeRoute(w, r, s.Routes)
-	if err != nil {
-		// prepare the error log
-		logger := errLog
-		if s.Logs != nil && s.Logs.LoggerNames != nil {
-			logger = logger.Named(s.Logs.LoggerNames[r.Host])
-		}
+	// execute the primary handler chain
+	err := s.primaryHandlerChain.ServeHTTP(w, r)
+	duration = time.Since(start)
 
-		// get the values that will be used to log the error
-		errStatus, errMsg, errFields := errLogValues(err)
+	// if no errors, we're done!
+	if err == nil {
+		return
+	}
 
-		// add HTTP error information to request context
-		r = s.Errors.WithError(r, err)
+	// restore original request before invoking error handler chain (issue #3717)
+	// TODO: this does not restore original headers, if modified (for efficiency)
+	origReq := r.Context().Value(OriginalRequestCtxKey).(http.Request)
+	r.Method = origReq.Method
+	r.RemoteAddr = origReq.RemoteAddr
+	r.RequestURI = origReq.RequestURI
+	cloneURL(origReq.URL, r.URL)
 
-		if s.Errors != nil && len(s.Errors.Routes) > 0 {
-			// execute user-defined error handling route
-			err2 := s.executeCompositeRoute(w, r, s.Errors.Routes)
-			if err2 == nil {
-				// user's error route handled the error response
-				// successfully, so now just log the error
-				if errStatus >= 500 {
-					logger.Error(errMsg, errFields...)
-				}
-			} else {
-				// well... this is awkward
-				errFields = append([]zapcore.Field{
-					zap.String("error", err2.Error()),
-					zap.Namespace("first_error"),
-					zap.String("msg", errMsg),
-				}, errFields...)
-				logger.Error("error handling handler error", errFields...)
-			}
-		} else {
+	// prepare the error log
+	logger := errLog
+	if s.Logs != nil {
+		logger = s.Logs.wrapLogger(logger, r.Host)
+	}
+	logger = logger.With(zap.Duration("duration", duration))
+
+	// get the values that will be used to log the error
+	errStatus, errMsg, errFields := errLogValues(err)
+
+	// add HTTP error information to request context
+	r = s.Errors.WithError(r, err)
+
+	if s.Errors != nil && len(s.Errors.Routes) > 0 {
+		// execute user-defined error handling route
+		err2 := s.errorHandlerChain.ServeHTTP(w, r)
+		if err2 == nil {
+			// user's error route handled the error response
+			// successfully, so now just log the error
 			if errStatus >= 500 {
 				logger.Error(errMsg, errFields...)
 			}
-			w.WriteHeader(errStatus)
+		} else {
+			// well... this is awkward
+			errFields = append([]zapcore.Field{
+				zap.String("error", err2.Error()),
+				zap.Namespace("first_error"),
+				zap.String("msg", errMsg),
+			}, errFields...)
+			logger.Error("error handling handler error", errFields...)
+			if handlerErr, ok := err.(HandlerError); ok {
+				w.WriteHeader(handlerErr.StatusCode)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
 		}
-	}
-}
-
-// executeCompositeRoute compiles a composite route from routeList and executes
-// it using w and r. This function handles the sentinel ErrRehandle error value,
-// which reprocesses requests through the stack again. Any error value returned
-// from this function would be an actual error that needs to be handled.
-func (s *Server) executeCompositeRoute(w http.ResponseWriter, r *http.Request, routeList RouteList) error {
-	maxRehandles := 0
-	if s.MaxRehandles != nil {
-		maxRehandles = *s.MaxRehandles
-	}
-	var err error
-	for i := -1; i <= maxRehandles; i++ {
-		// we started the counter at -1 because we
-		// always want to run this at least once
-
-		// the purpose of rehandling is often to give
-		// matchers a chance to re-evaluate on the
-		// changed version of the request, so compile
-		// the handler stack anew in each iteration
-		stack := routeList.BuildCompositeRoute(r)
-		stack = s.wrapPrimaryRoute(stack)
-
-		// only loop if rehandling is required
-		err = stack.ServeHTTP(w, r)
-		if err != ErrRehandle {
-			break
+	} else {
+		if errStatus >= 500 {
+			logger.Error(errMsg, errFields...)
 		}
-		if i >= maxRehandles-1 {
-			return fmt.Errorf("too many rehandles")
-		}
+		w.WriteHeader(errStatus)
 	}
-	return err
 }
 
 // wrapPrimaryRoute wraps stack (a compiled middleware handler chain)
@@ -353,8 +332,30 @@ func (s *Server) hasListenerAddress(fullAddr string) bool {
 			continue
 		}
 
-		// host must be the same and port must fall within port range
-		if (thisAddrs.Host == laddrs.Host) &&
+		// Apparently, Linux requires all bound ports to be distinct
+		// *regardless of host interface* even if the addresses are
+		// in fact different; binding "192.168.0.1:9000" and then
+		// ":9000" will fail for ":9000" because "address is already
+		// in use" even though it's not, and the same bindings work
+		// fine on macOS. I also found on Linux that listening on
+		// "[::]:9000" would fail with a similar error, except with
+		// the address "0.0.0.0:9000", as if deliberately ignoring
+		// that I specified the IPv6 interface explicitly. This seems
+		// to be a major bug in the Linux network stack and I don't
+		// know why it hasn't been fixed yet, so for now we have to
+		// special-case ourselves around Linux like a doting parent.
+		// The second issue seems very similar to a discussion here:
+		// https://github.com/nodejs/node/issues/9390
+		//
+		// This is very easy to reproduce by creating an HTTP server
+		// that listens to both addresses or just one with a host
+		// interface; or for a more confusing reproduction, try
+		// listening on "127.0.0.1:80" and ":443" and you'll see
+		// the error, if you take away the GOOS condition below.
+		//
+		// So, an address is equivalent if the port is in the port
+		// range, and if not on Linux, the host is the same... sigh.
+		if (runtime.GOOS == "linux" || thisAddrs.Host == laddrs.Host) &&
 			(laddrs.StartPort <= thisAddrs.EndPort) &&
 			(laddrs.StartPort >= thisAddrs.StartPort) {
 			return true
@@ -372,52 +373,20 @@ func (s *Server) hasTLSClientAuth() bool {
 	return false
 }
 
-// AutoHTTPSConfig is used to disable automatic HTTPS
-// or certain aspects of it for a specific server.
-// HTTPS is enabled automatically and by default when
-// qualifying hostnames are available from the config.
-type AutoHTTPSConfig struct {
-	// If true, automatic HTTPS will be entirely disabled.
-	Disabled bool `json:"disable,omitempty"`
-
-	// If true, only automatic HTTP->HTTPS redirects will
-	// be disabled.
-	DisableRedir bool `json:"disable_redirects,omitempty"`
-
-	// Hosts/domain names listed here will not be included
-	// in automatic HTTPS (they will not have certificates
-	// loaded nor redirects applied).
-	Skip []string `json:"skip,omitempty"`
-
-	// Hosts/domain names listed here will still be enabled
-	// for automatic HTTPS (unless in the Skip list), except
-	// that certificates will not be provisioned and managed
-	// for these names.
-	SkipCerts []string `json:"skip_certificates,omitempty"`
-
-	// By default, automatic HTTPS will obtain and renew
-	// certificates for qualifying hostnames. However, if
-	// a certificate with a matching SAN is already loaded
-	// into the cache, certificate management will not be
-	// enabled. To force automated certificate management
-	// regardless of loaded certificates, set this to true.
-	IgnoreLoadedCerts bool `json:"ignore_loaded_certificates,omitempty"`
-}
-
-// Skipped returns true if name is in skipSlice, which
-// should be one of the Skip* fields on ahc.
-func (ahc AutoHTTPSConfig) Skipped(name string, skipSlice []string) bool {
-	for _, n := range skipSlice {
-		if name == n {
-			return true
-		}
-	}
-	return false
-}
-
 // HTTPErrorConfig determines how to handle errors
 // from the HTTP handlers.
 type HTTPErrorConfig struct {
+	// The routes to evaluate after the primary handler
+	// chain returns an error. In an error route, extra
+	// placeholders are available:
+	//
+	// Placeholder | Description
+	// ------------|---------------
+	// `{http.error.status_code}` | The recommended HTTP status code
+	// `{http.error.status_text}` | The status text associated with the recommended status code
+	// `{http.error.message}`     | The error message
+	// `{http.error.trace}`       | The origin of the error
+	// `{http.error.id}`          | An identifier for this occurrence of the error
 	Routes RouteList `json:"routes,omitempty"`
 }
 
@@ -433,10 +402,10 @@ func (*HTTPErrorConfig) WithError(r *http.Request, err error) *http.Request {
 	r = r.WithContext(c)
 
 	// add error values to the replacer
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
-	repl.Set("http.error", err.Error())
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl.Set("http.error", err)
 	if handlerErr, ok := err.(HandlerError); ok {
-		repl.Set("http.error.status_code", strconv.Itoa(handlerErr.StatusCode))
+		repl.Set("http.error.status_code", handlerErr.StatusCode)
 		repl.Set("http.error.status_text", http.StatusText(handlerErr.StatusCode))
 		repl.Set("http.error.trace", handlerErr.Trace)
 		repl.Set("http.error.id", handlerErr.ID)
@@ -445,13 +414,116 @@ func (*HTTPErrorConfig) WithError(r *http.Request, err error) *http.Request {
 	return r
 }
 
-// ServerLogConfig describes a server's logging configuration.
+// shouldLogRequest returns true if this request should be logged.
+func (s *Server) shouldLogRequest(r *http.Request) bool {
+	if s.accessLogger == nil || s.Logs == nil {
+		// logging is disabled
+		return false
+	}
+	for _, dh := range s.Logs.SkipHosts {
+		// logging for this particular host is disabled
+		if r.Host == dh {
+			return false
+		}
+	}
+	if _, ok := s.Logs.LoggerNames[r.Host]; ok {
+		// this host is mapped to a particular logger name
+		return true
+	}
+	if s.Logs.SkipUnmappedHosts {
+		// this host is not mapped and thus must not be logged
+		return false
+	}
+	return true
+}
+
+// ServerLogConfig describes a server's logging configuration. If
+// enabled without customization, all requests to this server are
+// logged to the default logger; logger destinations may be
+// customized per-request-host.
 type ServerLogConfig struct {
+	// The default logger name for all logs emitted by this server for
+	// hostnames that are not in the LoggerNames (logger_names) map.
+	DefaultLoggerName string `json:"default_logger_name,omitempty"`
+
 	// LoggerNames maps request hostnames to a custom logger name.
 	// For example, a mapping of "example.com" to "example" would
 	// cause access logs from requests with a Host of example.com
 	// to be emitted by a logger named "http.log.access.example".
 	LoggerNames map[string]string `json:"logger_names,omitempty"`
+
+	// By default, all requests to this server will be logged if
+	// access logging is enabled. This field lists the request
+	// hosts for which access logging should be disabled.
+	SkipHosts []string `json:"skip_hosts,omitempty"`
+
+	// If true, requests to any host not appearing in the
+	// LoggerNames (logger_names) map will not be logged.
+	SkipUnmappedHosts bool `json:"skip_unmapped_hosts,omitempty"`
+}
+
+// wrapLogger wraps logger in a logger named according to user preferences for the given host.
+func (slc ServerLogConfig) wrapLogger(logger *zap.Logger, host string) *zap.Logger {
+	if loggerName := slc.getLoggerName(host); loggerName != "" {
+		return logger.Named(loggerName)
+	}
+	return logger
+}
+
+func (slc ServerLogConfig) getLoggerName(host string) string {
+	tryHost := func(key string) (string, bool) {
+		// first try exact match
+		if loggerName, ok := slc.LoggerNames[key]; ok {
+			return loggerName, ok
+		}
+		// strip port and try again (i.e. Host header of "example.com:1234" should
+		// match "example.com" if there is no "example.com:1234" in the map)
+		hostOnly, _, err := net.SplitHostPort(key)
+		if err != nil {
+			return "", false
+		}
+		loggerName, ok := slc.LoggerNames[hostOnly]
+		return loggerName, ok
+	}
+
+	// try the exact hostname first
+	if loggerName, ok := tryHost(host); ok {
+		return loggerName
+	}
+
+	// try matching wildcard domains if other non-specific loggers exist
+	labels := strings.Split(host, ".")
+	for i := range labels {
+		if labels[i] == "" {
+			continue
+		}
+		labels[i] = "*"
+		wildcardHost := strings.Join(labels, ".")
+		if loggerName, ok := tryHost(wildcardHost); ok {
+			return loggerName
+		}
+	}
+
+	return slc.DefaultLoggerName
+}
+
+// PrepareRequest fills the request r for use in a Caddy HTTP handler chain. w and s can
+// be nil, but the handlers will lose response placeholders and access to the server.
+func PrepareRequest(r *http.Request, repl *caddy.Replacer, w http.ResponseWriter, s *Server) *http.Request {
+	// set up the context for the request
+	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, ServerCtxKey, s)
+	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]interface{}))
+	ctx = context.WithValue(ctx, routeGroupCtxKey, make(map[string]struct{}))
+	var url2 url.URL // avoid letting this escape to the heap
+	ctx = context.WithValue(ctx, OriginalRequestCtxKey, originalRequest(r, &url2))
+	r = r.WithContext(ctx)
+
+	// once the pointer to the request won't change
+	// anymore, finish setting up the replacer
+	addHTTPVarsToReplacer(repl, r, w)
+
+	return r
 }
 
 // errLogValues inspects err and returns the status code
@@ -507,11 +579,11 @@ func cloneURL(from, to *url.URL) {
 }
 
 const (
-	// CommonLogFormat is the common log format. https://en.wikipedia.org/wiki/Common_Log_Format
-	CommonLogFormat = `{http.request.remote.host} ` + CommonLogEmptyValue + ` {http.authentication.user.id} [{time.now.common_log}] "{http.request.orig_method} {http.request.orig_uri} {http.request.proto}" {http.response.status} {http.response.size}`
+	// commonLogFormat is the common log format. https://en.wikipedia.org/wiki/Common_Log_Format
+	commonLogFormat = `{http.request.remote.host} ` + commonLogEmptyValue + ` {http.auth.user.id} [{time.now.common_log}] "{http.request.orig_method} {http.request.orig_uri} {http.request.proto}" {http.response.status} {http.response.size}`
 
-	// CommonLogEmptyValue is the common empty log value.
-	CommonLogEmptyValue = "-"
+	// commonLogEmptyValue is the common empty log value.
+	commonLogEmptyValue = "-"
 )
 
 // Context keys for HTTP request context values.

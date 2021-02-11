@@ -65,7 +65,12 @@ type ModuleInfo struct {
 
 	// New returns a pointer to a new, empty
 	// instance of the module's type. This
-	// function must not have any side-effects.
+	// method must not have any side-effects,
+	// and no other initialization should
+	// occur within it. Any initialization
+	// of the returned value should be done
+	// in a Provision() method (see the
+	// Provisioner interface).
 	New func() Module
 }
 
@@ -75,16 +80,16 @@ type ModuleInfo struct {
 // label is the module name, and the labels before that constitute
 // the namespace (or scope).
 //
-// Thus, a module ID has the form: <namespace>.<id>
+// Thus, a module ID has the form: <namespace>.<name>
 //
 // An ID with no dot has the empty namespace, which is appropriate
 // for app modules (these are "top-level" modules that Caddy core
 // loads and runs).
 //
-// Module IDs should be lowercase and use underscore (_) instead of
+// Module IDs should be lowercase and use underscores (_) instead of
 // spaces.
 //
-// Example valid names:
+// Examples of valid IDs:
 // - http
 // - http.handlers.file_server
 // - caddy.logging.encoders.json
@@ -92,16 +97,16 @@ type ModuleID string
 
 // Namespace returns the namespace (or scope) portion of a module ID,
 // which is all but the last label of the ID. If the ID has only one
-// label, then
+// label, then the namespace is empty.
 func (id ModuleID) Namespace() string {
 	lastDot := strings.LastIndex(string(id), ".")
 	if lastDot < 0 {
-		return string(id)
+		return ""
 	}
 	return string(id)[:lastDot]
 }
 
-// Name returns the Name (last element) of a module name.
+// Name returns the Name (last element) of a module ID.
 func (id ModuleID) Name() string {
 	if id == "" {
 		return ""
@@ -125,33 +130,32 @@ type ModuleMap map[string]json.RawMessage
 // be properly recorded, this should be called in the
 // init phase of runtime. Typically, the module package
 // will do this as a side-effect of being imported.
-// This function returns an error if the module's info
-// is incomplete or invalid, or if the module is
-// already registered.
-func RegisterModule(instance Module) error {
+// This function panics if the module's info is
+// incomplete or invalid, or if the module is already
+// registered.
+func RegisterModule(instance Module) {
 	mod := instance.CaddyModule()
 
 	if mod.ID == "" {
-		return fmt.Errorf("module ID missing")
+		panic("module ID missing")
 	}
 	if mod.ID == "caddy" || mod.ID == "admin" {
-		return fmt.Errorf("module ID '%s' is reserved", mod.ID)
+		panic(fmt.Sprintf("module ID '%s' is reserved", mod.ID))
 	}
 	if mod.New == nil {
-		return fmt.Errorf("missing ModuleInfo.New")
+		panic("missing ModuleInfo.New")
 	}
 	if val := mod.New(); val == nil {
-		return fmt.Errorf("ModuleInfo.New must return a non-nil module instance")
+		panic("ModuleInfo.New must return a non-nil module instance")
 	}
 
 	modulesMu.Lock()
 	defer modulesMu.Unlock()
 
 	if _, ok := modules[string(mod.ID)]; ok {
-		return fmt.Errorf("module already registered: %s", mod.ID)
+		panic(fmt.Sprintf("module already registered: %s", mod.ID))
 	}
 	modules[string(mod.ID)] = mod
-	return nil
 }
 
 // GetModule returns module information from its ID (full name).
@@ -210,7 +214,7 @@ func GetModules(scope string) []ModuleInfo {
 	var mods []ModuleInfo
 iterateModules:
 	for id, m := range modules {
-		modParts := strings.Split(string(id), ".")
+		modParts := strings.Split(id, ".")
 
 		// match only the next level of nesting
 		if len(modParts) != len(scopeParts)+1 {
@@ -241,9 +245,9 @@ func Modules() []string {
 	modulesMu.RLock()
 	defer modulesMu.RUnlock()
 
-	var names []string
+	names := make([]string, 0, len(modules))
 	for name := range modules {
-		names = append(names, string(name))
+		names = append(names, name)
 	}
 
 	sort.Strings(names)
@@ -294,8 +298,8 @@ type Provisioner interface {
 // Validator is implemented by modules which can verify that their
 // configurations are valid. This method will be called after
 // Provision() (if implemented). Validation should always be fast
-// (imperceptible running time) and an error should be returned only
-// if the value's configuration is invalid.
+// (imperceptible running time) and an error must be returned if
+// the module's configuration is invalid.
 type Validator interface {
 	Validate() error
 }

@@ -20,16 +20,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/mholt/certmagic"
+	"github.com/caddyserver/certmagic"
+	"go.uber.org/zap"
 )
 
 // Config is the top (or beginning) of the Caddy configuration structure.
@@ -59,11 +63,10 @@ type Config struct {
 	Logging *Logging     `json:"logging,omitempty"`
 
 	// StorageRaw is a storage module that defines how/where Caddy
-	// stores assets (such as TLS certificates). By default, this is
-	// the local file system (`caddy.storage.file_system` module).
-	// If the `XDG_DATA_HOME` environment variable is set, then
-	// `$XDG_DATA_HOME/caddy` is the default folder. Otherwise,
-	// `$HOME/.local/share/caddy` is the default folder.
+	// stores assets (such as TLS certificates). The default storage
+	// module is `caddy.storage.file_system` (the local file system),
+	// and the default path
+	// [depends on the OS and environment](/docs/conventions#data-directory).
 	StorageRaw json.RawMessage `json:"storage,omitempty" caddy:"namespace=caddy.storage inline_key=module"`
 
 	// AppsRaw are the apps that Caddy will load and run. The
@@ -148,13 +151,6 @@ func changeConfig(method, path string, input []byte, forceReload bool) error {
 		}
 	}
 
-	// remove any @id fields from the JSON, which would cause
-	// loading to break since the field wouldn't be recognized
-	// (an alternate way to do this would be to delete them from
-	// rawCfg as they are indexed, then iterate the index we made
-	// and add them back after encoding as JSON)
-	newCfg = RemoveMetaFields(newCfg)
-
 	// load this new config; if it fails, we need to revert to
 	// our old representation of caddy's actual config
 	err = unsyncedDecodeAndRun(newCfg)
@@ -194,7 +190,7 @@ func readConfig(path string, out io.Writer) error {
 	return unsyncedConfigAccess(http.MethodGet, path, nil, out)
 }
 
-// indexConfigObjects recurisvely searches ptr for object fields named
+// indexConfigObjects recursively searches ptr for object fields named
 // "@id" and maps that ID value to the full configPath in the index.
 // This function is NOT safe for concurrent access; obtain a write lock
 // on currentCfgMu.
@@ -232,15 +228,19 @@ func indexConfigObjects(ptr interface{}, configPath string, index map[string]str
 	return nil
 }
 
-// unsyncedDecodeAndRun decodes cfgJSON and runs
-// it as the new config, replacing any other
-// current config. It does not update the raw
-// config state, as this is a lower-level function;
-// most callers will want to use Load instead.
-// A write lock on currentCfgMu is required!
+// unsyncedDecodeAndRun removes any meta fields (like @id tags)
+// from cfgJSON, decodes the result into a *Config, and runs
+// it as the new config, replacing any other current config.
+// It does NOT update the raw config state, as this is a
+// lower-level function; most callers will want to use Load
+// instead. A write lock on currentCfgMu is required!
 func unsyncedDecodeAndRun(cfgJSON []byte) error {
+	// remove any @id fields from the JSON, which would cause
+	// loading to break since the field wouldn't be recognized
+	strippedCfgJSON := RemoveMetaFields(cfgJSON)
+
 	var newCfg *Config
-	err := strictUnmarshalJSON(cfgJSON, &newCfg)
+	err := strictUnmarshalJSON(strippedCfgJSON, &newCfg)
 	if err != nil {
 		return err
 	}
@@ -257,6 +257,30 @@ func unsyncedDecodeAndRun(cfgJSON []byte) error {
 
 	// Stop, Cleanup each old app
 	unsyncedStop(oldCfg)
+
+	// autosave a non-nil config, if not disabled
+	if newCfg != nil &&
+		(newCfg.Admin == nil ||
+			newCfg.Admin.Config == nil ||
+			newCfg.Admin.Config.Persist == nil ||
+			*newCfg.Admin.Config.Persist) {
+		dir := filepath.Dir(ConfigAutosavePath)
+		err := os.MkdirAll(dir, 0700)
+		if err != nil {
+			Log().Error("unable to create folder for config autosave",
+				zap.String("dir", dir),
+				zap.Error(err))
+		} else {
+			err := ioutil.WriteFile(ConfigAutosavePath, cfgJSON, 0600)
+			if err == nil {
+				Log().Info("autosaved config", zap.String("file", ConfigAutosavePath))
+			} else {
+				Log().Error("unable to autosave config",
+					zap.String("file", ConfigAutosavePath),
+					zap.Error(err))
+			}
+		}
+	}
 
 	return nil
 }
@@ -348,7 +372,7 @@ func run(newCfg *Config, start bool) error {
 		}
 
 		if newCfg.storage == nil {
-			newCfg.storage = &certmagic.FileStorage{Path: dataDir()}
+			newCfg.storage = DefaultStorage
 		}
 		certmagic.Default.Storage = newCfg.storage
 
@@ -358,14 +382,12 @@ func run(newCfg *Config, start bool) error {
 		return err
 	}
 
-	// Load, Provision, Validate each app and their submodules
+	// Load and Provision each app and their submodules
 	err = func() error {
-		appsIface, err := ctx.LoadModule(newCfg, "AppsRaw")
-		if err != nil {
-			return fmt.Errorf("loading app modules: %v", err)
-		}
-		for appName, appIface := range appsIface.(map[string]interface{}) {
-			newCfg.apps[appName] = appIface.(App)
+		for appName := range newCfg.AppsRaw {
+			if _, err := ctx.App(appName); err != nil {
+				return err
+			}
 		}
 		return nil
 	}()
@@ -448,6 +470,9 @@ func stopAndCleanup() error {
 		return err
 	}
 	certmagic.CleanUpOwnLocks()
+	if pidfile != "" {
+		return os.Remove(pidfile)
+	}
 	return nil
 }
 
@@ -464,7 +489,7 @@ func Validate(cfg *Config) error {
 // Duration can be an integer or a string. An integer is
 // interpreted as nanoseconds. If a string, it is a Go
 // time.Duration value such as `300ms`, `1.5h`, or `2h45m`;
-// valid units are `ns`, `us`/`µs`, `ms`, `s`, `m`, and `h`.
+// valid units are `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`, and `d`.
 type Duration time.Duration
 
 // UnmarshalJSON satisfies json.Unmarshaler.
@@ -475,12 +500,40 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	var dur time.Duration
 	var err error
 	if b[0] == byte('"') && b[len(b)-1] == byte('"') {
-		dur, err = time.ParseDuration(strings.Trim(string(b), `"`))
+		dur, err = ParseDuration(strings.Trim(string(b), `"`))
 	} else {
 		err = json.Unmarshal(b, &dur)
 	}
 	*d = Duration(dur)
 	return err
+}
+
+// ParseDuration parses a duration string, adding
+// support for the "d" unit meaning number of days,
+// where a day is assumed to be 24h.
+func ParseDuration(s string) (time.Duration, error) {
+	var inNumber bool
+	var numStart int
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == 'd' {
+			daysStr := s[numStart:i]
+			days, err := strconv.ParseFloat(daysStr, 64)
+			if err != nil {
+				return 0, err
+			}
+			hours := days * 24.0
+			hoursStr := strconv.FormatFloat(hours, 'f', -1, 64)
+			s = s[:numStart] + hoursStr + "h" + s[i+1:]
+			i--
+			continue
+		}
+		if !inNumber {
+			numStart = i
+		}
+		inNumber = (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '+'
+	}
+	return time.ParseDuration(s)
 }
 
 // GoModule returns the build info of this Caddy
@@ -506,7 +559,7 @@ func goModule(mod *debug.Module) *debug.Module {
 		// TODO: track related Go issue: https://github.com/golang/go/issues/29228
 		// once that issue is fixed, we should just be able to use bi.Main... hopefully.
 		for _, dep := range bi.Deps {
-			if dep.Path == "github.com/caddyserver/caddy/v2" {
+			if dep.Path == ImportPath {
 				return dep
 			}
 		}
@@ -543,3 +596,6 @@ var (
 	// path, for converting /id/ paths to /config/ paths.
 	rawCfgIndex map[string]string
 )
+
+// ImportPath is the package import path for Caddy core.
+const ImportPath = "github.com/caddyserver/caddy/v2"

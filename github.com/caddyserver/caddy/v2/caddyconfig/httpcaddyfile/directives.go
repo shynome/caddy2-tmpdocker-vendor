@@ -16,6 +16,10 @@ package httpcaddyfile
 
 import (
 	"encoding/json"
+	"net"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -23,24 +27,59 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-// defaultDirectiveOrder specifies the order
+// directiveOrder specifies the order
 // to apply directives in HTTP routes.
-var defaultDirectiveOrder = []string{
+//
+// The root directive goes first in case rewrites or
+// redirects depend on existence of files, i.e. the
+// file matcher, which must know the root first.
+//
+// The header directive goes second so that headers
+// can be manipulated before doing redirects.
+var directiveOrder = []string{
+	"map",
+	"root",
+
+	"header",
+	"request_body",
+
+	"redir",
 	"rewrite",
-	"strip_prefix",
-	"strip_suffix",
-	"uri_replace",
+
+	// URI manipulation
+	"uri",
 	"try_files",
+
+	// middleware handlers; some wrap responses
 	"basicauth",
-	"headers",
 	"request_header",
 	"encode",
 	"templates",
-	"redir",
+
+	// special routing & dispatching directives
+	"handle",
+	"handle_path",
+	"route",
+	"push",
+
+	// handlers that typically respond to requests
 	"respond",
+	"metrics",
 	"reverse_proxy",
 	"php_fastcgi",
 	"file_server",
+	"acme_server",
+}
+
+// directiveIsOrdered returns true if dir is
+// a known, ordered (sorted) directive.
+func directiveIsOrdered(dir string) bool {
+	for _, d := range directiveOrder {
+		if d == dir {
+			return true
+		}
+	}
+	return false
 }
 
 // RegisterDirective registers a unique directive dir with an
@@ -64,20 +103,11 @@ func RegisterHandlerDirective(dir string, setupFunc UnmarshalHandlerFunc) {
 			return nil, h.ArgErr()
 		}
 
-		matcherSet, ok, err := h.MatcherToken()
+		matcherSet, err := h.ExtractMatcherSet()
 		if err != nil {
 			return nil, err
 		}
-		if ok {
-			// strip matcher token; we don't need to
-			// use the return value here because a
-			// new dispenser should have been made
-			// solely for this directive's tokens,
-			// with no other uses of same slice
-			h.Dispenser.Delete()
-		}
 
-		h.Dispenser.Reset() // pretend this lookahead never happened
 		val, err := setupFunc(h)
 		if err != nil {
 			return nil, err
@@ -87,14 +117,28 @@ func RegisterHandlerDirective(dir string, setupFunc UnmarshalHandlerFunc) {
 	})
 }
 
+// RegisterGlobalOption registers a unique global option opt with
+// an associated unmarshaling (setup) function. When the global
+// option opt is encountered in a Caddyfile, setupFunc will be
+// called to unmarshal its tokens.
+func RegisterGlobalOption(opt string, setupFunc UnmarshalGlobalFunc) {
+	if _, ok := registeredGlobalOptions[opt]; ok {
+		panic("global option " + opt + " already registered")
+	}
+	registeredGlobalOptions[opt] = setupFunc
+}
+
 // Helper is a type which helps setup a value from
 // Caddyfile tokens.
 type Helper struct {
 	*caddyfile.Dispenser
-	options     map[string]interface{}
-	warnings    *[]caddyconfig.Warning
-	matcherDefs map[string]caddy.ModuleMap
-	parentBlock caddyfile.ServerBlock
+	// State stores intermediate variables during caddyfile adaptation.
+	State        map[string]interface{}
+	options      map[string]interface{}
+	warnings     *[]caddyconfig.Warning
+	matcherDefs  map[string]caddy.ModuleMap
+	parentBlock  caddyfile.ServerBlock
+	groupCounter counter
 }
 
 // Option gets the option keyed by name.
@@ -126,8 +170,8 @@ func (h Helper) JSON(val interface{}) json.RawMessage {
 	return caddyconfig.JSON(val, h.warnings)
 }
 
-// MatcherToken assumes the current token is (possibly) a matcher, and
-// if so, returns the matcher set along with a true value. If the current
+// MatcherToken assumes the next argument token is (possibly) a matcher,
+// and if so, returns the matcher set along with a true value. If the next
 // token is not a matcher, nil and false is returned. Note that a true
 // value may be returned with a nil matcher set if it is a catch-all.
 func (h Helper) MatcherToken() (caddy.ModuleMap, bool, error) {
@@ -135,6 +179,28 @@ func (h Helper) MatcherToken() (caddy.ModuleMap, bool, error) {
 		return nil, false, nil
 	}
 	return matcherSetFromMatcherToken(h.Dispenser.Token(), h.matcherDefs, h.warnings)
+}
+
+// ExtractMatcherSet is like MatcherToken, except this is a higher-level
+// method that returns the matcher set described by the matcher token,
+// or nil if there is none, and deletes the matcher token from the
+// dispenser and resets it as if this look-ahead never happened. Useful
+// when wrapping a route (one or more handlers) in a user-defined matcher.
+func (h Helper) ExtractMatcherSet() (caddy.ModuleMap, error) {
+	matcherSet, hasMatcher, err := h.MatcherToken()
+	if err != nil {
+		return nil, err
+	}
+	if hasMatcher {
+		// strip matcher token; we don't need to
+		// use the return value here because a
+		// new dispenser should have been made
+		// solely for this directive's tokens,
+		// with no other uses of same slice
+		h.Dispenser.Delete()
+	}
+	h.Dispenser.Reset() // pretend this lookahead never happened
+	return matcherSet, nil
 }
 
 // NewRoute returns config values relevant to creating a new HTTP route.
@@ -164,16 +230,115 @@ func (h Helper) NewRoute(matcherSet caddy.ModuleMap,
 	}
 }
 
+// GroupRoutes adds the routes (caddyhttp.Route type) in vals to the
+// same group, if there is more than one route in vals.
+func (h Helper) GroupRoutes(vals []ConfigValue) {
+	// ensure there's at least two routes; group of one is pointless
+	var count int
+	for _, v := range vals {
+		if _, ok := v.Value.(caddyhttp.Route); ok {
+			count++
+			if count > 1 {
+				break
+			}
+		}
+	}
+	if count < 2 {
+		return
+	}
+
+	// now that we know the group will have some effect, do it
+	groupName := h.groupCounter.nextGroup()
+	for i := range vals {
+		if route, ok := vals[i].Value.(caddyhttp.Route); ok {
+			route.Group = groupName
+			vals[i].Value = route
+		}
+	}
+}
+
 // NewBindAddresses returns config values relevant to adding
 // listener bind addresses to the config.
 func (h Helper) NewBindAddresses(addrs []string) []ConfigValue {
 	return []ConfigValue{{Class: "bind", Value: addrs}}
 }
 
-// NewVarsRoute returns config values relevant to adding a
-// "vars" wrapper route to the config.
-func (h Helper) NewVarsRoute(route caddyhttp.Route) []ConfigValue {
-	return []ConfigValue{{Class: "var", Value: route}}
+// ParseSegmentAsSubroute parses the segment such that its subdirectives
+// are themselves treated as directives, from which a subroute is built
+// and returned.
+func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
+	allResults, err := parseSegmentAsConfig(h)
+	if err != nil {
+		return nil, err
+	}
+
+	return buildSubroute(allResults, h.groupCounter)
+}
+
+// parseSegmentAsConfig parses the segment such that its subdirectives
+// are themselves treated as directives, including named matcher definitions,
+// and the raw Config structs are returned.
+func parseSegmentAsConfig(h Helper) ([]ConfigValue, error) {
+	var allResults []ConfigValue
+
+	for h.Next() {
+		// don't allow non-matcher args on the first line
+		if h.NextArg() {
+			return nil, h.ArgErr()
+		}
+
+		// slice the linear list of tokens into top-level segments
+		var segments []caddyfile.Segment
+		for nesting := h.Nesting(); h.NextBlock(nesting); {
+			segments = append(segments, h.NextSegment())
+		}
+
+		// copy existing matcher definitions so we can augment
+		// new ones that are defined only in this scope
+		matcherDefs := make(map[string]caddy.ModuleMap, len(h.matcherDefs))
+		for key, val := range h.matcherDefs {
+			matcherDefs[key] = val
+		}
+
+		// find and extract any embedded matcher definitions in this scope
+		for i := 0; i < len(segments); i++ {
+			seg := segments[i]
+			if strings.HasPrefix(seg.Directive(), matcherPrefix) {
+				// parse, then add the matcher to matcherDefs
+				err := parseMatcherDefinitions(caddyfile.NewDispenser(seg), matcherDefs)
+				if err != nil {
+					return nil, err
+				}
+				// remove the matcher segment (consumed), then step back the loop
+				segments = append(segments[:i], segments[i+1:]...)
+				i--
+			}
+		}
+
+		// with matchers ready to go, evaluate each directive's segment
+		for _, seg := range segments {
+			dir := seg.Directive()
+			dirFunc, ok := registeredDirectives[dir]
+			if !ok {
+				return nil, h.Errf("unrecognized directive: %s", dir)
+			}
+
+			subHelper := h
+			subHelper.Dispenser = caddyfile.NewDispenser(seg)
+			subHelper.matcherDefs = matcherDefs
+
+			results, err := dirFunc(subHelper)
+			if err != nil {
+				return nil, h.Errf("parsing caddyfile tokens for '%s': %v", dir, err)
+			}
+			for _, result := range results {
+				result.directive = dir
+				allResults = append(allResults, result)
+			}
+		}
+	}
+
+	return allResults, nil
 }
 
 // ConfigValue represents a value to be added to the final
@@ -196,12 +361,123 @@ type ConfigValue struct {
 	directive string
 }
 
-// serverBlock pairs a Caddyfile server block
-// with a "pile" of config values, keyed by class
-// name.
+func sortRoutes(routes []ConfigValue) {
+	dirPositions := make(map[string]int)
+	for i, dir := range directiveOrder {
+		dirPositions[dir] = i
+	}
+
+	sort.SliceStable(routes, func(i, j int) bool {
+		// if the directives are different, just use the established directive order
+		iDir, jDir := routes[i].directive, routes[j].directive
+		if iDir != jDir {
+			return dirPositions[iDir] < dirPositions[jDir]
+		}
+
+		// directives are the same; sub-sort by path matcher length if there's
+		// only one matcher set and one path (this is a very common case and
+		// usually -- but not always -- helpful/expected, oh well; user can
+		// always take manual control of order using handler or route blocks)
+		iRoute, ok := routes[i].Value.(caddyhttp.Route)
+		if !ok {
+			return false
+		}
+		jRoute, ok := routes[j].Value.(caddyhttp.Route)
+		if !ok {
+			return false
+		}
+
+		// decode the path matchers, if there is just one of them
+		var iPM, jPM caddyhttp.MatchPath
+		if len(iRoute.MatcherSetsRaw) == 1 {
+			_ = json.Unmarshal(iRoute.MatcherSetsRaw[0]["path"], &iPM)
+		}
+		if len(jRoute.MatcherSetsRaw) == 1 {
+			_ = json.Unmarshal(jRoute.MatcherSetsRaw[0]["path"], &jPM)
+		}
+
+		// sort by longer path (more specific) first; missing path
+		// matchers or multi-matchers are treated as zero-length paths
+		var iPathLen, jPathLen int
+		if len(iPM) > 0 {
+			iPathLen = len(iPM[0])
+		}
+		if len(jPM) > 0 {
+			jPathLen = len(jPM[0])
+		}
+
+		// if both directives have no path matcher, use whichever one
+		// has any kind of matcher defined first.
+		if iPathLen == 0 && jPathLen == 0 {
+			return len(iRoute.MatcherSetsRaw) > 0 && len(jRoute.MatcherSetsRaw) == 0
+		}
+
+		// sort with the most-specific (longest) path first
+		return iPathLen > jPathLen
+	})
+}
+
+// serverBlock pairs a Caddyfile server block with
+// a "pile" of config values, keyed by class name,
+// as well as its parsed keys for convenience.
 type serverBlock struct {
 	block caddyfile.ServerBlock
 	pile  map[string][]ConfigValue // config values obtained from directives
+	keys  []Address
+}
+
+// hostsFromKeys returns a list of all the non-empty hostnames found in
+// the keys of the server block sb. If logger mode is false, a key with
+// an empty hostname portion will return an empty slice, since that
+// server block is interpreted to effectively match all hosts. An empty
+// string is never added to the slice.
+//
+// If loggerMode is true, then the non-standard ports of keys will be
+// joined to the hostnames. This is to effectively match the Host
+// header of requests that come in for that key.
+//
+// The resulting slice is not sorted but will never have duplicates.
+func (sb serverBlock) hostsFromKeys(loggerMode bool) []string {
+	// ensure each entry in our list is unique
+	hostMap := make(map[string]struct{})
+	for _, addr := range sb.keys {
+		if addr.Host == "" {
+			if !loggerMode {
+				// server block contains a key like ":443", i.e. the host portion
+				// is empty / catch-all, which means to match all hosts
+				return []string{}
+			}
+			// never append an empty string
+			continue
+		}
+		if loggerMode &&
+			addr.Port != "" &&
+			addr.Port != strconv.Itoa(caddyhttp.DefaultHTTPPort) &&
+			addr.Port != strconv.Itoa(caddyhttp.DefaultHTTPSPort) {
+			hostMap[net.JoinHostPort(addr.Host, addr.Port)] = struct{}{}
+		} else {
+			hostMap[addr.Host] = struct{}{}
+		}
+	}
+
+	// convert map to slice
+	sblockHosts := make([]string, 0, len(hostMap))
+	for host := range hostMap {
+		sblockHosts = append(sblockHosts, host)
+	}
+
+	return sblockHosts
+}
+
+// hasHostCatchAllKey returns true if sb has a key that
+// omits a host portion, i.e. it "catches all" hosts.
+func (sb serverBlock) hasHostCatchAllKey() bool {
+	for _, addr := range sb.keys {
+		if addr.Host == "" {
+			return true
+		}
+	}
+	return false
 }
 
 type (
@@ -220,6 +496,13 @@ type (
 	// for you. These are passed to a call to
 	// RegisterHandlerDirective.
 	UnmarshalHandlerFunc func(h Helper) (caddyhttp.MiddlewareHandler, error)
+
+	// UnmarshalGlobalFunc is a function which can unmarshal Caddyfile
+	// tokens into a global option config value using a Helper type.
+	// These are passed in a call to RegisterGlobalOption.
+	UnmarshalGlobalFunc func(d *caddyfile.Dispenser) (interface{}, error)
 )
 
 var registeredDirectives = make(map[string]UnmarshalFunc)
+
+var registeredGlobalOptions = make(map[string]UnmarshalGlobalFunc)

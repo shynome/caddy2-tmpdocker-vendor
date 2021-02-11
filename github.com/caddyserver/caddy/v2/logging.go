@@ -27,6 +27,7 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 func init() {
@@ -35,12 +36,14 @@ func init() {
 	RegisterModule(DiscardWriter{})
 }
 
-// Logging facilitates logging within Caddy.
+// Logging facilitates logging within Caddy. The default log is
+// called "default" and you can customize it. You can also define
+// additional logs.
 //
 // By default, all logs at INFO level and higher are written to
 // standard error ("stderr" writer) in a human-readable format
-// ("console" encoder). The default log is called "default" and
-// you can customize it. You can also define additional logs.
+// ("console" encoder if stdout is an interactive terminal, "json"
+// encoder otherwise).
 //
 // All defined logs accept all log entries by default, but you
 // can filter by level and module/logger names. A logger's name
@@ -50,10 +53,10 @@ func init() {
 // "http.handlers", because all HTTP handler module names have
 // that prefix.
 //
-// Caddy logs (except the sink) are mostly zero-allocation, so
-// they are very high-performing in terms of memory and CPU time.
-// Enabling sampling can further increase throughput on extremely
-// high-load servers.
+// Caddy logs (except the sink) are zero-allocation, so they are
+// very high-performing in terms of memory and CPU time. Enabling
+// sampling can further increase throughput on extremely high-load
+// servers.
 type Logging struct {
 	// Sink is the destination for all unstructured logs emitted
 	// from Go's standard library logger. These logs are common
@@ -76,7 +79,7 @@ type Logging struct {
 }
 
 // openLogs sets up the config and opens all the configured writers.
-// It closes its logs when ctx is cancelled, so it should clean up
+// It closes its logs when ctx is canceled, so it should clean up
 // after itself.
 func (logging *Logging) openLogs(ctx Context) error {
 	// make sure to deallocate resources when context is done
@@ -184,7 +187,7 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 
 // closeLogs cleans up resources allocated during openLogs.
 // A successful call to openLogs calls this automatically
-// when the context is cancelled.
+// when the context is canceled.
 func (logging *Logging) closeLogs() error {
 	for _, key := range logging.writerKeys {
 		_, err := writers.Delete(key)
@@ -214,7 +217,7 @@ func (logging *Logging) Logger(mod Module) *zap.Logger {
 
 	multiCore := zapcore.NewTee(cores...)
 
-	return zap.New(multiCore).Named(string(modID))
+	return zap.New(multiCore).Named(modID)
 }
 
 // openWriter opens a writer using opener, and returns true if
@@ -393,17 +396,6 @@ func (cl *CustomLog) provision(ctx Context, logging *Logging) error {
 		}
 	}
 
-	if cl.EncoderRaw != nil {
-		mod, err := ctx.LoadModule(cl, "EncoderRaw")
-		if err != nil {
-			return fmt.Errorf("loading log encoder module: %v", err)
-		}
-		cl.encoder = mod.(zapcore.Encoder)
-	}
-	if cl.encoder == nil {
-		cl.encoder = newDefaultProductionLogEncoder()
-	}
-
 	if cl.WriterRaw != nil {
 		mod, err := ctx.LoadModule(cl, "WriterRaw")
 		if err != nil {
@@ -418,6 +410,24 @@ func (cl *CustomLog) provision(ctx Context, logging *Logging) error {
 	cl.writer, _, err = logging.openWriter(cl.writerOpener)
 	if err != nil {
 		return fmt.Errorf("opening log writer using %#v: %v", cl.writerOpener, err)
+	}
+
+	if cl.EncoderRaw != nil {
+		mod, err := ctx.LoadModule(cl, "EncoderRaw")
+		if err != nil {
+			return fmt.Errorf("loading log encoder module: %v", err)
+		}
+		cl.encoder = mod.(zapcore.Encoder)
+	}
+	if cl.encoder == nil {
+		// only allow colorized output if this log is going to stdout or stderr
+		var colorize bool
+		switch cl.writerOpener.(type) {
+		case StdoutWriter, StderrWriter,
+			*StdoutWriter, *StderrWriter:
+			colorize = true
+		}
+		cl.encoder = newDefaultProductionLogEncoder(colorize)
 	}
 
 	cl.buildCore()
@@ -448,14 +458,14 @@ func (cl *CustomLog) buildCore() {
 		if cl.Sampling.Thereafter == 0 {
 			cl.Sampling.Thereafter = 100
 		}
-		c = zapcore.NewSampler(c, cl.Sampling.Interval,
+		c = zapcore.NewSamplerWithOptions(c, cl.Sampling.Interval,
 			cl.Sampling.First, cl.Sampling.Thereafter)
 	}
 	cl.core = c
 }
 
 func (cl *CustomLog) matchesModule(moduleID string) bool {
-	return cl.loggerAllowed(string(moduleID), true)
+	return cl.loggerAllowed(moduleID, true)
 }
 
 // loggerAllowed returns true if name is allowed to emit
@@ -647,7 +657,7 @@ func newDefaultProductionLog() (*defaultCustomLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	cl.encoder = newDefaultProductionLogEncoder()
+	cl.encoder = newDefaultProductionLogEncoder(true)
 	cl.levelEnabler = zapcore.InfoLevel
 
 	cl.buildCore()
@@ -658,13 +668,19 @@ func newDefaultProductionLog() (*defaultCustomLog, error) {
 	}, nil
 }
 
-func newDefaultProductionLogEncoder() zapcore.Encoder {
+func newDefaultProductionLogEncoder(colorize bool) zapcore.Encoder {
 	encCfg := zap.NewProductionEncoderConfig()
-	encCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	encCfg.EncodeTime = func(ts time.Time, encoder zapcore.PrimitiveArrayEncoder) {
-		encoder.AppendString(ts.UTC().Format("2006/01/02 15:04:05.000"))
+	if terminal.IsTerminal(int(os.Stdout.Fd())) {
+		// if interactive terminal, make output more human-readable by default
+		encCfg.EncodeTime = func(ts time.Time, encoder zapcore.PrimitiveArrayEncoder) {
+			encoder.AppendString(ts.UTC().Format("2006/01/02 15:04:05.000"))
+		}
+		if colorize {
+			encCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		}
+		return zapcore.NewConsoleEncoder(encCfg)
 	}
-	return zapcore.NewConsoleEncoder(encCfg)
+	return zapcore.NewJSONEncoder(encCfg)
 }
 
 // Log returns the current default logger.

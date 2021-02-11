@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -31,9 +33,16 @@ import (
 	"go.uber.org/zap"
 )
 
-// HealthChecks holds configuration related to health checking.
+// HealthChecks configures active and passive health checks.
 type HealthChecks struct {
-	Active  *ActiveHealthChecks  `json:"active,omitempty"`
+	// Active health checks run in the background on a timer. To
+	// minimally enable active health checks, set either path or
+	// port (or both).
+	Active *ActiveHealthChecks `json:"active,omitempty"`
+
+	// Passive health checks monitor proxied requests for errors or timeouts.
+	// To minimally enable passive health checks, specify at least an empty
+	// config object.
 	Passive *PassiveHealthChecks `json:"passive,omitempty"`
 }
 
@@ -41,16 +50,34 @@ type HealthChecks struct {
 // health checks (that is, health checks which occur in a
 // background goroutine independently).
 type ActiveHealthChecks struct {
-	Path         string         `json:"path,omitempty"`
-	Port         int            `json:"port,omitempty"`
-	Headers      http.Header    `json:"headers,omitempty"`
-	Interval     caddy.Duration `json:"interval,omitempty"`
-	Timeout      caddy.Duration `json:"timeout,omitempty"`
-	MaxSize      int64          `json:"max_size,omitempty"`
-	ExpectStatus int            `json:"expect_status,omitempty"`
-	ExpectBody   string         `json:"expect_body,omitempty"`
+	// The URI path to use for health checks.
+	Path string `json:"path,omitempty"`
 
-	stopChan   chan struct{}
+	// The port to use (if different from the upstream's dial
+	// address) for health checks.
+	Port int `json:"port,omitempty"`
+
+	// HTTP headers to set on health check requests.
+	Headers http.Header `json:"headers,omitempty"`
+
+	// How frequently to perform active health checks (default 30s).
+	Interval caddy.Duration `json:"interval,omitempty"`
+
+	// How long to wait for a response from a backend before
+	// considering it unhealthy (default 5s).
+	Timeout caddy.Duration `json:"timeout,omitempty"`
+
+	// The maximum response body to download from the backend
+	// during a health check.
+	MaxSize int64 `json:"max_size,omitempty"`
+
+	// The HTTP status code to expect from a healthy backend.
+	ExpectStatus int `json:"expect_status,omitempty"`
+
+	// A regular expression against which to match the response
+	// body of a healthy backend.
+	ExpectBody string `json:"expect_body,omitempty"`
+
 	httpClient *http.Client
 	bodyRegexp *regexp.Regexp
 	logger     *zap.Logger
@@ -60,18 +87,35 @@ type ActiveHealthChecks struct {
 // health checks (that is, health checks which occur during
 // the normal flow of request proxying).
 type PassiveHealthChecks struct {
-	MaxFails              int            `json:"max_fails,omitempty"`
-	FailDuration          caddy.Duration `json:"fail_duration,omitempty"`
-	UnhealthyRequestCount int            `json:"unhealthy_request_count,omitempty"`
-	UnhealthyStatus       []int          `json:"unhealthy_status,omitempty"`
-	UnhealthyLatency      caddy.Duration `json:"unhealthy_latency,omitempty"`
+	// How long to remember a failed request to a backend. A duration > 0
+	// enables passive health checking. Default is 0.
+	FailDuration caddy.Duration `json:"fail_duration,omitempty"`
+
+	// The number of failed requests within the FailDuration window to
+	// consider a backend as "down". Must be >= 1; default is 1. Requires
+	// that FailDuration be > 0.
+	MaxFails int `json:"max_fails,omitempty"`
+
+	// Limits the number of simultaneous requests to a backend by
+	// marking the backend as "down" if it has this many concurrent
+	// requests or more.
+	UnhealthyRequestCount int `json:"unhealthy_request_count,omitempty"`
+
+	// Count the request as failed if the response comes back with
+	// one of these status codes.
+	UnhealthyStatus []int `json:"unhealthy_status,omitempty"`
+
+	// Count the request as failed if the response takes at least this
+	// long to receive.
+	UnhealthyLatency caddy.Duration `json:"unhealthy_latency,omitempty"`
 
 	logger *zap.Logger
 }
 
 // CircuitBreaker is a type that can act as an early-warning
 // system for the health checker when backends are getting
-// overloaded.
+// overloaded. This interface is still experimental and is
+// subject to change.
 type CircuitBreaker interface {
 	OK() bool
 	RecordMetric(statusCode int, latency time.Duration)
@@ -81,27 +125,43 @@ type CircuitBreaker interface {
 // regular basis and blocks until
 // h.HealthChecks.Active.stopChan is closed.
 func (h *Handler) activeHealthChecker() {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("[PANIC] active health checks: %v\n%s", err, debug.Stack())
+		}
+	}()
 	ticker := time.NewTicker(time.Duration(h.HealthChecks.Active.Interval))
-	h.doActiveHealthChecksForAllHosts()
+	h.doActiveHealthCheckForAllHosts()
 	for {
 		select {
 		case <-ticker.C:
-			h.doActiveHealthChecksForAllHosts()
-		case <-h.HealthChecks.Active.stopChan:
+			h.doActiveHealthCheckForAllHosts()
+		case <-h.ctx.Done():
 			ticker.Stop()
 			return
 		}
 	}
 }
 
-// doActiveHealthChecksForAllHosts immediately performs a
-// health checks for all hosts in the global repository.
-func (h *Handler) doActiveHealthChecksForAllHosts() {
-	hosts.Range(func(key, value interface{}) bool {
-		networkAddr := key.(string)
-		host := value.(Host)
+// doActiveHealthCheckForAllHosts immediately performs a
+// health checks for all upstream hosts configured by h.
+func (h *Handler) doActiveHealthCheckForAllHosts() {
+	for _, upstream := range h.Upstreams {
+		go func(upstream *Upstream) {
+			defer func() {
+				if err := recover(); err != nil {
+					log.Printf("[PANIC] active health check: %v\n%s", err, debug.Stack())
+				}
+			}()
 
-		go func(networkAddr string, host Host) {
+			networkAddr, err := caddy.NewReplacer().ReplaceOrErr(upstream.Dial, true, true)
+			if err != nil {
+				h.HealthChecks.Active.logger.Error("invalid use of placeholders in dial address for active health checks",
+					zap.String("address", networkAddr),
+					zap.Error(err),
+				)
+				return
+			}
 			addr, err := caddy.ParseNetworkAddress(networkAddr)
 			if err != nil {
 				h.HealthChecks.Active.logger.Error("bad network address",
@@ -110,7 +170,13 @@ func (h *Handler) doActiveHealthChecksForAllHosts() {
 				)
 				return
 			}
-			if addr.PortRangeSize() != 1 {
+			if hcp := uint(upstream.activeHealthCheckPort); hcp != 0 {
+				if addr.IsUnixNetwork() {
+					addr.Network = "tcp" // I guess we just assume TCP since we are using a port??
+				}
+				addr.StartPort, addr.EndPort = hcp, hcp
+			}
+			if upstream.LookupSRV == "" && addr.PortRangeSize() != 1 {
 				h.HealthChecks.Active.logger.Error("multiple addresses (upstream must map to only one address)",
 					zap.String("address", networkAddr),
 				)
@@ -123,18 +189,15 @@ func (h *Handler) doActiveHealthChecksForAllHosts() {
 				// so use a fake Host value instead; unix sockets are usually local
 				hostAddr = "localhost"
 			}
-			err = h.doActiveHealthCheck(DialInfo{Network: addr.Network, Address: hostAddr}, hostAddr, host)
+			err = h.doActiveHealthCheck(DialInfo{Network: addr.Network, Address: hostAddr}, hostAddr, upstream.Host)
 			if err != nil {
 				h.HealthChecks.Active.logger.Error("active health check failed",
-					zap.String("address", networkAddr),
+					zap.String("address", hostAddr),
 					zap.Error(err),
 				)
 			}
-		}(networkAddr, host)
-
-		// continue to iterate all hosts
-		return true
-	})
+		}(upstream)
+	}
 }
 
 // doActiveHealthCheck performs a health check to host which
@@ -147,7 +210,7 @@ func (h *Handler) doActiveHealthChecksForAllHosts() {
 func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, host Host) error {
 	// create the URL for the request that acts as a health check
 	scheme := "http"
-	if ht, ok := h.Transport.(*http.Transport); ok && ht.TLSClientConfig != nil {
+	if ht, ok := h.Transport.(TLSTransport); ok && ht.TLSEnabled() {
 		// this is kind of a hacky way to know if we should use HTTPS, but whatever
 		scheme = "https"
 	}
@@ -168,9 +231,11 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, host H
 	}
 
 	// attach dialing information to this request
-	ctx := context.Background()
+	ctx := h.ctx.Context
 	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, caddy.NewReplacer())
-	ctx = context.WithValue(ctx, DialInfoCtxKey, dialInfo)
+	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, map[string]interface{}{
+		dialInfoVarKey: dialInfo,
+	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return fmt.Errorf("making request: %v", err)
@@ -198,7 +263,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, host H
 	}
 	defer func() {
 		// drain any remaining body so connection could be re-used
-		io.Copy(ioutil.Discard, body)
+		_, _ = io.Copy(ioutil.Discard, body)
 		resp.Body.Close()
 	}()
 
@@ -287,19 +352,23 @@ func (h *Handler) countFailure(upstream *Upstream) {
 	if err != nil {
 		h.HealthChecks.Passive.logger.Error("could not count failure",
 			zap.String("host", upstream.Dial),
-			zap.Error(err),
-		)
+			zap.Error(err))
+		return
 	}
 
 	// forget it later
 	go func(host Host, failDuration time.Duration) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[PANIC] health check failure forgetter: %v\n%s", err, debug.Stack())
+			}
+		}()
 		time.Sleep(failDuration)
 		err := host.CountFail(-1)
 		if err != nil {
 			h.HealthChecks.Passive.logger.Error("could not forget failure",
 				zap.String("host", upstream.Dial),
-				zap.Error(err),
-			)
+				zap.Error(err))
 		}
 	}(upstream.Host, failDuration)
 }

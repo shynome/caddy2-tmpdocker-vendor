@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"path"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -38,12 +40,6 @@ func init() {
 
 // Transport facilitates FastCGI communication.
 type Transport struct {
-	// TODO: Populate these
-	softwareName    string
-	softwareVersion string
-	serverName      string
-	serverPort      string
-
 	// Use this directory as the fastcgi root directory. Defaults to the root
 	// directory of the parent virtual host.
 	Root string `json:"root,omitempty"`
@@ -52,12 +48,21 @@ type Transport struct {
 	// with the value of SplitPath. The first piece will be assumed as the
 	// actual resource (CGI script) name, and the second piece will be set to
 	// PATH_INFO for the CGI script to use.
+	//
 	// Future enhancements should be careful to avoid CVE-2019-11043,
 	// which can be mitigated with use of a try_files-like behavior
-	// that 404's if the fastcgi path info is not found.
-	SplitPath string `json:"split_path,omitempty"`
+	// that 404s if the fastcgi path info is not found.
+	SplitPath []string `json:"split_path,omitempty"`
 
-	// Extra environment variables
+	// Path declared as root directory will be resolved to its absolute value
+	// after the evaluation of any symbolic links.
+	// Due to the nature of PHP opcache, root directory path is cached: when
+	// using a symlinked directory as root this could generate errors when
+	// symlink is changed without php-fpm being restarted; enabling this
+	// directive will set $_SERVER['DOCUMENT_ROOT'] to the real directory path.
+	ResolveRootSymlink bool `json:"resolve_root_symlink,omitempty"`
+
+	// Extra environment variables.
 	EnvVars map[string]string `json:"env,omitempty"`
 
 	// The duration used to set a deadline when connecting to an upstream.
@@ -68,6 +73,9 @@ type Transport struct {
 
 	// The duration used to set a deadline when sending to the FastCGI server.
 	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
+
+	serverSoftware string
+	logger         *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -79,9 +87,14 @@ func (Transport) CaddyModule() caddy.ModuleInfo {
 }
 
 // Provision sets up t.
-func (t *Transport) Provision(_ caddy.Context) error {
+func (t *Transport) Provision(ctx caddy.Context) error {
+	t.logger = ctx.Logger(t)
 	if t.Root == "" {
 		t.Root = "{http.vars.root}"
+	}
+	t.serverSoftware = "Caddy"
+	if mod := caddy.GoModule(); mod.Version != "" {
+		t.serverSoftware += "/" + mod.Version
 	}
 	return nil
 }
@@ -101,14 +114,18 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		defer cancel()
 	}
 
-	// extract dial information from request (this
-	// should embedded by the reverse proxy)
+	// extract dial information from request (should have been embedded by the reverse proxy)
 	network, address := "tcp", r.URL.Host
-	if dialInfoVal := ctx.Value(reverseproxy.DialInfoCtxKey); dialInfoVal != nil {
-		dialInfo := dialInfoVal.(reverseproxy.DialInfo)
+	if dialInfo, ok := reverseproxy.GetDialInfo(ctx); ok {
 		network = dialInfo.Network
 		address = dialInfo.Address
 	}
+
+	t.logger.Debug("roundtrip",
+		zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
+		zap.String("dial", address),
+		zap.Any("env", env), // TODO: this uses reflection I think
+	)
 
 	fcgiBackend, err := DialContext(ctx, network, address)
 	if err != nil {
@@ -147,7 +164,7 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 // buildEnv returns a set of CGI environment variables for the request.
 func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	var env map[string]string
 
@@ -164,21 +181,41 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 	ip = strings.Replace(ip, "[", "", 1)
 	ip = strings.Replace(ip, "]", "", 1)
 
-	root := repl.ReplaceAll(t.Root, ".")
+	// make sure file root is absolute
+	root, err := filepath.Abs(repl.ReplaceAll(t.Root, "."))
+	if err != nil {
+		return nil, err
+	}
+
+	if t.ResolveRootSymlink {
+		root, err = filepath.EvalSymlinks(root)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	fpath := r.URL.Path
-
-	// Split path in preparation for env variables.
-	// Previous canSplit checks ensure this can never be -1.
-	// TODO: I haven't brought over canSplit; make sure this doesn't break
-	splitPos := t.splitPos(fpath)
-
-	// Request has the extension; path was split successfully
-	docURI := fpath[:splitPos+len(t.SplitPath)]
-	pathInfo := fpath[splitPos+len(t.SplitPath):]
 	scriptName := fpath
 
-	// Strip PATH_INFO from SCRIPT_NAME
-	scriptName = strings.TrimSuffix(scriptName, pathInfo)
+	docURI := fpath
+	// split "actual path" from "path info" if configured
+	var pathInfo string
+	if splitPos := t.splitPos(fpath); splitPos > -1 {
+		docURI = fpath[:splitPos]
+		pathInfo = fpath[splitPos:]
+
+		// Strip PATH_INFO from SCRIPT_NAME
+		scriptName = strings.TrimSuffix(scriptName, pathInfo)
+	}
+
+	// Try to grab the path remainder from a file matcher
+	// if we didn't get a split result here.
+	// See https://github.com/caddyserver/caddy/issues/3718
+	if pathInfo == "" {
+		if remainder, ok := repl.GetString("http.matchers.file.remainder"); ok {
+			pathInfo = remainder
+		}
+	}
 
 	// SCRIPT_FILENAME is the absolute path of SCRIPT_NAME
 	scriptFilename := filepath.Join(root, scriptName)
@@ -187,6 +224,12 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 	// have difficulty discovering its URL.
 	pathPrefix, _ := r.Context().Value(caddy.CtxKey("path_prefix")).(string)
 	scriptName = path.Join(pathPrefix, scriptName)
+
+	// Ensure the SCRIPT_NAME has a leading slash for compliance with RFC3875
+	// Info: https://tools.ietf.org/html/rfc3875#section-4.1.13
+	if scriptName != "" && !strings.HasPrefix(scriptName, "/") {
+		scriptName = "/" + scriptName
+	}
 
 	// Get the request URL from context. The context stores the original URL in case
 	// it was changed by a middleware such as rewrite. By default, we pass the
@@ -206,6 +249,17 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 		requestScheme = "https"
 	}
 
+	reqHost, reqPort, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		// whatever, just assume there was no port
+		reqHost = r.Host
+	}
+
+	authUser := ""
+	if val, ok := repl.Get("http.auth.user.id"); ok {
+		authUser = val.(string)
+	}
+
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.
 	env = map[string]string{
@@ -220,13 +274,12 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 		"REMOTE_HOST":       ip, // For speed, remote host lookups disabled
 		"REMOTE_PORT":       port,
 		"REMOTE_IDENT":      "", // Not used
-		"REMOTE_USER":       "", // TODO: once there are authentication handlers, populate this
+		"REMOTE_USER":       authUser,
 		"REQUEST_METHOD":    r.Method,
 		"REQUEST_SCHEME":    requestScheme,
-		"SERVER_NAME":       t.serverName,
-		"SERVER_PORT":       t.serverPort,
+		"SERVER_NAME":       reqHost,
 		"SERVER_PROTOCOL":   r.Proto,
-		"SERVER_SOFTWARE":   t.softwareName + "/" + t.softwareVersion,
+		"SERVER_SOFTWARE":   t.serverSoftware,
 
 		// Other variables
 		"DOCUMENT_ROOT":   root,
@@ -244,6 +297,13 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 		env["PATH_TRANSLATED"] = filepath.Join(root, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
 	}
 
+	// compliance with the CGI specification requires that
+	// SERVER_PORT should only exist if it's a valid numeric value.
+	// Info: https://www.ietf.org/rfc/rfc3875 Page 18
+	if reqPort != "" {
+		env["SERVER_PORT"] = reqPort
+	}
+
 	// Some web apps rely on knowing HTTPS or not
 	if r.TLS != nil {
 		env["HTTPS"] = "on"
@@ -254,9 +314,9 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 			env["SSL_PROTOCOL"] = v
 		}
 		// and pass the cipher suite in a manner compatible with apache's mod_ssl
-		for k, v := range caddytls.SupportedCipherSuites {
-			if v == r.TLS.CipherSuite {
-				env["SSL_CIPHER"] = k
+		for _, cs := range caddytls.SupportedCipherSuites() {
+			if cs.ID == r.TLS.CipherSuite {
+				env["SSL_CIPHER"] = cs.Name
 				break
 			}
 		}
@@ -279,14 +339,23 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 // splitPos returns the index where path should
 // be split based on t.SplitPath.
 func (t Transport) splitPos(path string) int {
-	// TODO:
+	// TODO: from v1...
 	// if httpserver.CaseSensitivePath {
 	// 	return strings.Index(path, r.SplitPath)
 	// }
-	return strings.Index(strings.ToLower(path), strings.ToLower(t.SplitPath))
+	if len(t.SplitPath) == 0 {
+		return 0
+	}
+
+	lowerPath := strings.ToLower(path)
+	for _, split := range t.SplitPath {
+		if idx := strings.Index(lowerPath, strings.ToLower(split)); idx > -1 {
+			return idx + len(split)
+		}
+	}
+	return -1
 }
 
-// TODO:
 // Map of supported protocols to Apache ssl_mod format
 // Note that these are slightly different from SupportedProtocols in caddytls/config.go
 var tlsProtocolStrings = map[uint16]string{

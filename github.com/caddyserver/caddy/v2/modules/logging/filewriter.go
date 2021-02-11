@@ -17,10 +17,14 @@ package logging
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/dustin/go-humanize"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -96,7 +100,7 @@ func (fw FileWriter) WriterKey() string {
 // OpenWriter opens a new file writer.
 func (fw FileWriter) OpenWriter() (io.WriteCloser, error) {
 	// roll log files by default
-	if fw.Roll == nil || *fw.Roll == true {
+	if fw.Roll == nil || *fw.Roll {
 		if fw.RollSizeMB == 0 {
 			fw.RollSizeMB = 100
 		}
@@ -125,7 +129,87 @@ func (fw FileWriter) OpenWriter() (io.WriteCloser, error) {
 	return os.OpenFile(fw.Filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 }
 
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
+//
+//     file <filename> {
+//         roll_disabled
+//         roll_size     <size>
+//         roll_keep     <num>
+//         roll_keep_for <days>
+//     }
+//
+// The roll_size value has megabyte resolution.
+// Fractional values are rounded up to the next whole megabyte (MiB).
+//
+// The roll_keep_for duration has day resolution.
+// Fractional values are rounded up to the next whole number of days.
+//
+// If any of the roll_size, roll_keep, or roll_keep_for subdirectives are
+// omitted or set to a zero value, then Caddy's default value for that
+// subdirective is used.
+func (fw *FileWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if !d.NextArg() {
+			return d.ArgErr()
+		}
+		fw.Filename = d.Val()
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "roll_disabled":
+				var f bool
+				fw.Roll = &f
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+
+			case "roll_size":
+				var sizeStr string
+				if !d.AllArgs(&sizeStr) {
+					return d.ArgErr()
+				}
+				size, err := humanize.ParseBytes(sizeStr)
+				if err != nil {
+					return d.Errf("parsing size: %v", err)
+				}
+				fw.RollSizeMB = int(math.Ceil(float64(size) / humanize.MiByte))
+
+			case "roll_keep":
+				var keepStr string
+				if !d.AllArgs(&keepStr) {
+					return d.ArgErr()
+				}
+				keep, err := strconv.Atoi(keepStr)
+				if err != nil {
+					return d.Errf("parsing roll_keep number: %v", err)
+				}
+				fw.RollKeep = keep
+
+			case "roll_keep_for":
+				var keepForStr string
+				if !d.AllArgs(&keepForStr) {
+					return d.ArgErr()
+				}
+				keepFor, err := caddy.ParseDuration(keepForStr)
+				if err != nil {
+					return d.Errf("parsing roll_keep_for duration: %v", err)
+				}
+				if keepFor < 0 {
+					return d.Errf("negative roll_keep_for duration: %v", keepFor)
+				}
+				fw.RollKeepDays = int(math.Ceil(keepFor.Hours() / 24))
+			}
+		}
+	}
+	return nil
+}
+
 // Interface guards
 var (
-	_ caddy.Provisioner = (*FileWriter)(nil)
+	_ caddy.Provisioner     = (*FileWriter)(nil)
+	_ caddy.WriterOpener    = (*FileWriter)(nil)
+	_ caddyfile.Unmarshaler = (*FileWriter)(nil)
 )

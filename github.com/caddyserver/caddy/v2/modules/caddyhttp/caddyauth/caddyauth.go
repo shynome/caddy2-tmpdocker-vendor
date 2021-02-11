@@ -16,11 +16,11 @@ package caddyauth
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -28,10 +28,22 @@ func init() {
 }
 
 // Authentication is a middleware which provides user authentication.
+// Rejects requests with HTTP 401 if the request is not authenticated.
+//
+// After a successful authentication, the placeholder
+// `{http.auth.user.id}` will be set to the username, and also
+// `{http.auth.user.*}` placeholders may be set for any authentication
+// modules that provide user metadata.
+//
+// Its API is still experimental and may be subject to change.
 type Authentication struct {
+	// A set of authentication providers. If none are specified,
+	// all requests will always be unauthenticated.
 	ProvidersRaw caddy.ModuleMap `json:"providers,omitempty" caddy:"namespace=http.authentication.providers"`
 
 	Providers map[string]Authenticator `json:"-"`
+
+	logger *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -44,6 +56,7 @@ func (Authentication) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up a.
 func (a *Authentication) Provision(ctx caddy.Context) error {
+	a.logger = ctx.Logger(a)
 	a.Providers = make(map[string]Authenticator)
 	mods, err := ctx.LoadModule(a, "ProvidersRaw")
 	if err != nil {
@@ -62,7 +75,9 @@ func (a Authentication) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	for provName, prov := range a.Providers {
 		user, authed, err = prov.Authenticate(w, r)
 		if err != nil {
-			log.Printf("[ERROR] Authenticating with %s: %v", provName, err)
+			a.logger.Error("auth provider returned error",
+				zap.String("provider", provName),
+				zap.Error(err))
 			continue
 		}
 		if authed {
@@ -73,8 +88,11 @@ func (a Authentication) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("not authenticated"))
 	}
 
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
-	repl.Set("http.authentication.user.id", user.ID)
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl.Set("http.auth.user.id", user.ID)
+	for k, v := range user.Metadata {
+		repl.Set("http.auth.user."+k, v)
+	}
 
 	return next.ServeHTTP(w, r)
 }
@@ -89,7 +107,15 @@ type Authenticator interface {
 
 // User represents an authenticated user.
 type User struct {
+	// The ID of the authenticated user.
 	ID string
+
+	// Any other relevant data about this
+	// user. Keys should be adhere to Caddy
+	// conventions (snake_casing), as all
+	// keys will be made available as
+	// placeholders.
+	Metadata map[string]string
 }
 
 // Interface guards

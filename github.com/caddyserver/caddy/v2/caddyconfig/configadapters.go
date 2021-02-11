@@ -17,6 +17,8 @@ package caddyconfig
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 // Adapter is a type which can adapt a configuration to Caddy JSON.
@@ -49,14 +51,13 @@ func JSON(val interface{}, warnings *[]Warning) json.RawMessage {
 	return b
 }
 
-// JSONModuleObject is like JSON, except it marshals val into a JSON object
-// and then adds a key to that object named fieldName with the value fieldVal.
-// This is useful for JSON-encoding module values where the module name has to
-// be described within the object by a certain key; for example,
-// "responder": "file_server" for a file server HTTP responder. The val must
-// encode into a map[string]interface{} (i.e. it must be a struct or map),
-// and any errors are converted into warnings, so this can be conveniently
-// used when filling a struct. For correct code, there should be no errors.
+// JSONModuleObject is like JSON(), except it marshals val into a JSON object
+// with an added key named fieldName with the value fieldVal. This is useful
+// for encoding module values where the module name has to be described within
+// the object by a certain key; for example, `"handler": "file_server"` for a
+// file server HTTP handler (fieldName="handler" and fieldVal="file_server").
+// The val parameter must encode into a map[string]interface{} (i.e. it must be
+// a struct or map). Any errors are converted into warnings.
 func JSONModuleObject(val interface{}, fieldName, fieldVal string, warnings *[]Warning) json.RawMessage {
 	// encode to a JSON object first
 	enc, err := json.Marshal(val)
@@ -99,19 +100,37 @@ func JSONIndent(val interface{}) ([]byte, error) {
 }
 
 // RegisterAdapter registers a config adapter with the given name.
-// This should usually be done at init-time.
-func RegisterAdapter(name string, adapter Adapter) error {
+// This should usually be done at init-time. It panics if the
+// adapter cannot be registered successfully.
+func RegisterAdapter(name string, adapter Adapter) {
 	if _, ok := configAdapters[name]; ok {
-		return fmt.Errorf("%s: already registered", name)
+		panic(fmt.Errorf("%s: already registered", name))
 	}
 	configAdapters[name] = adapter
-	return nil
+	caddy.RegisterModule(adapterModule{name, adapter})
 }
 
 // GetAdapter returns the adapter with the given name,
 // or nil if one with that name is not registered.
 func GetAdapter(name string) Adapter {
 	return configAdapters[name]
+}
+
+// adapterModule is a wrapper type that can turn any config
+// adapter into a Caddy module, which has the benefit of being
+// counted with other modules, even though they do not
+// technically extend the Caddy configuration structure.
+// See caddyserver/caddy#3132.
+type adapterModule struct {
+	name string
+	Adapter
+}
+
+func (am adapterModule) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  caddy.ModuleID("caddy.adapters." + am.name),
+		New: func() caddy.Module { return am },
+	}
 }
 
 var configAdapters = make(map[string]Adapter)

@@ -18,13 +18,16 @@ import (
 	"crypto/tls"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/certmagic"
 )
 
 func init() {
 	caddy.RegisterModule(MatchServerName{})
 }
 
-// MatchServerName matches based on SNI.
+// MatchServerName matches based on SNI. Names in
+// this list may use left-most-label wildcards,
+// similar to wildcard certificates.
 type MatchServerName []string
 
 // CaddyModule returns the Caddy module information.
@@ -38,8 +41,7 @@ func (MatchServerName) CaddyModule() caddy.ModuleInfo {
 // Match matches hello based on SNI.
 func (m MatchServerName) Match(hello *tls.ClientHelloInfo) bool {
 	for _, name := range m {
-		// TODO: support wildcards (and regex?)
-		if hello.ServerName == name {
+		if certmagic.MatchWildcard(hello.ServerName, name) {
 			return true
 		}
 	}

@@ -21,7 +21,7 @@ import (
 	"log"
 	"reflect"
 
-	"github.com/mholt/certmagic"
+	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 )
 
@@ -30,7 +30,7 @@ import (
 // that spawned the modules which are loaded. It should be used
 // with care and wrapped with derivation functions from the
 // standard context package only if you don't need the Caddy
-// specific features. These contexts are cancelled when the
+// specific features. These contexts are canceled when the
 // lifetime of the modules loaded from it is over.
 //
 // Use NewContext() to get a valid value (but most modules will
@@ -75,7 +75,7 @@ func NewContext(ctx Context) (Context, context.CancelFunc) {
 	return newCtx, wrappedCancel
 }
 
-// OnCancel executes f when ctx is cancelled.
+// OnCancel executes f when ctx is canceled.
 func (ctx *Context) OnCancel(f func()) {
 	ctx.cleanupFuncs = append(ctx.cleanupFuncs, f)
 }
@@ -92,6 +92,7 @@ func (ctx *Context) OnCancel(f func()) {
 //
 //    json.RawMessage              => interface{}
 //    []json.RawMessage            => []interface{}
+//    [][]json.RawMessage          => [][]interface{}
 //    map[string]json.RawMessage   => map[string]interface{}
 //    []map[string]json.RawMessage => []map[string]interface{}
 //
@@ -179,6 +180,27 @@ func (ctx Context) LoadModule(structPointer interface{}, fieldName string) (inte
 			}
 			result = all
 
+		} else if typ.Elem().Kind() == reflect.Slice && isJSONRawMessage(typ.Elem().Elem()) {
+			// val is `[][]json.RawMessage`
+
+			if inlineModuleKey == "" {
+				panic("unable to determine module name without inline_key because type is not a ModuleMap")
+			}
+			var all [][]interface{}
+			for i := 0; i < val.Len(); i++ {
+				innerVal := val.Index(i)
+				var allInner []interface{}
+				for j := 0; j < innerVal.Len(); j++ {
+					innerInnerVal, err := ctx.loadModuleInline(inlineModuleKey, moduleNamespace, innerVal.Index(j).Interface().(json.RawMessage))
+					if err != nil {
+						return nil, fmt.Errorf("position %d: %v", j, err)
+					}
+					allInner = append(allInner, innerInnerVal)
+				}
+				all = append(all, allInner)
+			}
+			result = all
+
 		} else if isModuleMapType(typ.Elem()) {
 			// val is `[]map[string]json.RawMessage`
 
@@ -211,7 +233,7 @@ func (ctx Context) LoadModule(structPointer interface{}, fieldName string) (inte
 }
 
 // loadModulesFromSomeMap loads modules from val, which must be a type of map[string]interface{}.
-// Depending on inlineModuleKey, it will be interpeted as either a ModuleMap (key is the module
+// Depending on inlineModuleKey, it will be interpreted as either a ModuleMap (key is the module
 // name) or as a regular map (key is not the module name, and module name is defined inline).
 func (ctx Context) loadModulesFromSomeMap(namespace, inlineModuleKey string, val reflect.Value) (map[string]interface{}, error) {
 	// if no inline_key is specified, then val must be a ModuleMap,
@@ -377,16 +399,25 @@ func (ctx Context) loadModuleInline(moduleNameKey, moduleScope string, raw json.
 	return val, nil
 }
 
-// App returns the configured app named name. If no app with
-// that name is currently configured, a new empty one will be
-// instantiated. (The app module must still be registered.)
+// App returns the configured app named name. If that app has
+// not yet been loaded and provisioned, it will be immediately
+// loaded and provisioned. If no app with that name is
+// configured, a new empty one will be instantiated instead.
+// (The app module must still be registered.) This must not be
+// called during the Provision/Validate phase to reference a
+// module's own host app (since the parent app module is still
+// in the process of being provisioned, it is not yet ready).
 func (ctx Context) App(name string) (interface{}, error) {
 	if app, ok := ctx.cfg.apps[name]; ok {
 		return app, nil
 	}
-	modVal, err := ctx.LoadModuleByID(name, nil)
+	appRaw := ctx.cfg.AppsRaw[name]
+	modVal, err := ctx.LoadModuleByID(name, appRaw)
 	if err != nil {
-		return nil, fmt.Errorf("instantiating new module %s: %v", name, err)
+		return nil, fmt.Errorf("loading %s app module: %v", name, err)
+	}
+	if appRaw != nil {
+		ctx.cfg.AppsRaw[name] = nil // allow GC to deallocate
 	}
 	ctx.cfg.apps[name] = modVal.(App)
 	return modVal, nil

@@ -15,6 +15,7 @@
 package fileserver
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -63,7 +64,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 			case "index":
 				fsrv.IndexNames = h.RemainingArgs()
-				if len(fsrv.Hide) == 0 {
+				if len(fsrv.IndexNames) == 0 {
 					return nil, h.ArgErr()
 				}
 			case "root":
@@ -85,7 +86,14 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	// hide the Caddyfile (and any imported Caddyfiles)
 	if configFiles := h.Caddyfiles(); len(configFiles) > 0 {
 		for _, file := range configFiles {
+			file = filepath.Clean(file)
 			if !fileHidden(file, fsrv.Hide) {
+				// if there's no path separator, the file server module will hide all
+				// files by that name, rather than a specific one; but we want to hide
+				// only this specific file, so ensure there's always a path separator
+				if !strings.Contains(file, separator) {
+					file = "." + separator + file
+				}
 				fsrv.Hide = append(fsrv.Hide, file)
 			}
 		}
@@ -102,16 +110,22 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //
 // and is basically shorthand for:
 //
-//    matcher:try_files {
+//    @try_files {
 //        file {
 //            try_files <files...>
 //        }
 //    }
-//    rewrite match:try_files {http.matchers.file.relative}{http.request.uri.query_string}
+//    rewrite @try_files {http.matchers.file.relative}
 //
-// If any of the files in the list have a query string, the query string will
-// be ignored when checking for file existence, but will be augmented into
-// the request's URI when rewriting the request.
+// This directive rewrites request paths only, preserving any other part
+// of the URI, unless the part is explicitly given in the file list. For
+// example, if any of the files in the list have a query string:
+//
+//    try_files {path} index.php?{query}&p={path}
+//
+// then the query string will not be treated as part of the file name; and
+// if that file matches, the given query string will replace any query string
+// that already exists on the request URI.
 func parseTryFiles(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
 	if !h.Next() {
 		return nil, h.ArgErr()
@@ -123,17 +137,14 @@ func parseTryFiles(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) 
 	}
 
 	// makeRoute returns a route that tries the files listed in try
-	// and then rewrites to the matched file, and appends writeURIAppend
-	// to the end of the query string.
-	makeRoute := func(try []string, writeURIAppend string) []httpcaddyfile.ConfigValue {
+	// and then rewrites to the matched file; userQueryString is
+	// appended to the rewrite rule.
+	makeRoute := func(try []string, userQueryString string) []httpcaddyfile.ConfigValue {
 		handler := rewrite.Rewrite{
-			Rehandle: true,
-			URI:      "{http.matchers.file.relative}{http.request.uri.query_string}" + writeURIAppend,
+			URI: "{http.matchers.file.relative}" + userQueryString,
 		}
 		matcherSet := caddy.ModuleMap{
-			"file": h.JSON(MatchFile{
-				TryFiles: try,
-			}),
+			"file": h.JSON(MatchFile{TryFiles: try}),
 		}
 		return h.NewRoute(matcherSet, handler)
 	}
@@ -143,14 +154,14 @@ func parseTryFiles(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) 
 	// if there are query strings in the list, we have to split into
 	// a separate route for each item with a query string, because
 	// the rewrite is different for that item
-	var try []string
+	try := make([]string, 0, len(tryFiles))
 	for _, item := range tryFiles {
 		if idx := strings.Index(item, "?"); idx >= 0 {
 			if len(try) > 0 {
 				result = append(result, makeRoute(try, "")...)
 				try = []string{}
 			}
-			result = append(result, makeRoute([]string{item[:idx]}, "&"+item[idx+1:])...)
+			result = append(result, makeRoute([]string{item[:idx]}, item[idx:])...)
 			continue
 		}
 		// accumulate consecutive non-query-string parameters
@@ -159,6 +170,11 @@ func parseTryFiles(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) 
 	if len(try) > 0 {
 		result = append(result, makeRoute(try, "")...)
 	}
+
+	// ensure that multiple routes (possible if rewrite targets
+	// have query strings, for example) are grouped together
+	// so only the first matching rewrite is performed (#2891)
+	h.GroupRoutes(result)
 
 	return result, nil
 }

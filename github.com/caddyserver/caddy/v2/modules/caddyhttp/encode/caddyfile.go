@@ -42,7 +42,6 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //     encode [<matcher>] <formats...> {
 //         gzip [<level>]
 //         zstd
-//         brotli [<quality>]
 //     }
 //
 // Specifying the formats on the first line will use those formats' defaults.
@@ -73,7 +72,7 @@ func (enc *Encode) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !ok {
 				return fmt.Errorf("encoder module '%s' is not a Caddyfile unmarshaler", mod)
 			}
-			err = unm.UnmarshalCaddyfile(d.NewFromNextTokens())
+			err = unm.UnmarshalCaddyfile(d.NewFromNextSegment())
 			if err != nil {
 				return err
 			}

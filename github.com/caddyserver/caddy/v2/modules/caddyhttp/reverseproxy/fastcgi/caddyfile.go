@@ -17,6 +17,7 @@ package fastcgi
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -38,6 +39,10 @@ func init() {
 //         root <path>
 //         split <at>
 //         env <key> <value>
+//         resolve_root_symlink
+//         dial_timeout <duration>
+//         read_timeout <duration>
+//         write_timeout <duration>
 //     }
 //
 func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -51,10 +56,10 @@ func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				t.Root = d.Val()
 
 			case "split":
-				if !d.NextArg() {
+				t.SplitPath = d.RemainingArgs()
+				if len(t.SplitPath) == 0 {
 					return d.ArgErr()
 				}
-				t.SplitPath = d.Val()
 
 			case "env":
 				args := d.RemainingArgs()
@@ -65,6 +70,42 @@ func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					t.EnvVars = make(map[string]string)
 				}
 				t.EnvVars[args[0]] = args[1]
+
+			case "resolve_root_symlink":
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+				t.ResolveRootSymlink = true
+
+			case "dial_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad timeout value %s: %v", d.Val(), err)
+				}
+				t.DialTimeout = caddy.Duration(dur)
+
+			case "read_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad timeout value %s: %v", d.Val(), err)
+				}
+				t.ReadTimeout = caddy.Duration(dur)
+
+			case "write_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad timeout value %s: %v", d.Val(), err)
+				}
+				t.WriteTimeout = caddy.Duration(dur)
 
 			default:
 				return d.Errf("unrecognized subdirective %s", d.Val())
@@ -81,9 +122,9 @@ func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //
 //     php_fastcgi localhost:7777
 //
-// is equivalent to:
+// is equivalent to a route consisting of:
 //
-//     matcher canonicalPath {
+//     @canonicalPath {
 //         file {
 //             try_files {path}/index.php
 //         }
@@ -91,21 +132,21 @@ func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //             path */
 //         }
 //     }
-//     redir match:canonicalPath {path}/ 308
+//     redir @canonicalPath {path}/ 308
 //
 //     try_files {path} {path}/index.php index.php
 //
-//     matcher phpFiles {
+//     @phpFiles {
 //         path *.php
 //     }
-//     reverse_proxy match:phpFiles localhost:7777 {
+//     reverse_proxy @phpFiles localhost:7777 {
 //         transport fastcgi {
 //             split .php
 //         }
 //     }
 //
-// Thus, this directive produces multiple routes, each with a different
-// matcher because multiple consecutive routes are necessary to support
+// Thus, this directive produces multiple handlers, each with a different
+// matcher because multiple consecutive handlers are necessary to support
 // the common PHP use case. If this "common" config is not compatible
 // with a user's PHP requirements, they can use a manual approach based
 // on the example above to configure it precisely as they need.
@@ -114,7 +155,7 @@ func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //
 //     php_fastcgi /subpath localhost:7777
 //
-// then the resulting routes are wrapped in a subroute that uses the
+// then the resulting handlers are wrapped in a subroute that uses the
 // user's matcher as a prerequisite to enter the subroute. In other
 // words, the directive's matcher is necessary, but not sufficient.
 func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
@@ -122,63 +163,188 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 		return nil, h.ArgErr()
 	}
 
-	// route to redirect to canonical path if index PHP file
-	redirMatcherSet := caddy.ModuleMap{
-		"file": h.JSON(fileserver.MatchFile{
-			TryFiles: []string{"{http.request.uri.path}/index.php"},
-		}),
-		"not": h.JSON(caddyhttp.MatchNegate{
-			MatchersRaw: caddy.ModuleMap{
-				"path": h.JSON(caddyhttp.MatchPath{"*/"}),
-			},
-		}),
-	}
-	redirHandler := caddyhttp.StaticResponse{
-		StatusCode: caddyhttp.WeakString("308"),
-		Headers:    http.Header{"Location": []string{"{http.request.uri.path}/"}},
-	}
-	redirRoute := caddyhttp.Route{
-		MatcherSetsRaw: []caddy.ModuleMap{redirMatcherSet},
-		HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(redirHandler, "handler", "static_response", nil)},
-	}
+	// set up the transport for FastCGI, and specifically PHP
+	fcgiTransport := Transport{}
 
-	// route to rewrite to PHP index file
-	rewriteMatcherSet := caddy.ModuleMap{
-		"file": h.JSON(fileserver.MatchFile{
-			TryFiles: []string{"{http.request.uri.path}", "{http.request.uri.path}/index.php", "index.php"},
-		}),
-	}
-	rewriteHandler := rewrite.Rewrite{
-		URI:      "{http.matchers.file.relative}{http.request.uri.query_string}",
-		Rehandle: true,
-	}
-	rewriteRoute := caddyhttp.Route{
-		MatcherSetsRaw: []caddy.ModuleMap{rewriteMatcherSet},
-		HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(rewriteHandler, "handler", "rewrite", nil)},
-	}
+	// set up the set of file extensions allowed to execute PHP code
+	extensions := []string{".php"}
 
-	// route to actually reverse proxy requests to PHP files;
-	// match only requests that are for PHP files
-	rpMatcherSet := caddy.ModuleMap{
-		"path": h.JSON([]string{"*.php"}),
-	}
+	// set the default index file for the try_files rewrites
+	indexFile := "index.php"
 
 	// if the user specified a matcher token, use that
 	// matcher in a route that wraps both of our routes;
 	// either way, strip the matcher token and pass
 	// the remaining tokens to the unmarshaler so that
 	// we can gain the rest of the reverse_proxy syntax
-	userMatcherSet, hasUserMatcher, err := h.MatcherToken()
+	userMatcherSet, err := h.ExtractMatcherSet()
 	if err != nil {
 		return nil, err
 	}
-	if hasUserMatcher {
-		h.Dispenser.Delete() // strip matcher token
-	}
-	h.Dispenser.Reset() // pretend this lookahead never happened
 
-	// set up the transport for FastCGI, and specifically PHP
-	fcgiTransport := Transport{SplitPath: ".php"}
+	// make a new dispenser from the remaining tokens so that we
+	// can reset the dispenser back to this point for the
+	// reverse_proxy unmarshaler to read from it as well
+	dispenser := h.NewFromNextSegment()
+
+	// read the subdirectives that we allow as overrides to
+	// the php_fastcgi shortcut
+	// NOTE: we delete the tokens as we go so that the reverse_proxy
+	// unmarshal doesn't see these subdirectives which it cannot handle
+	for dispenser.Next() {
+		for dispenser.NextBlock(0) {
+			switch dispenser.Val() {
+			case "root":
+				if !dispenser.NextArg() {
+					return nil, dispenser.ArgErr()
+				}
+				fcgiTransport.Root = dispenser.Val()
+				dispenser.Delete()
+				dispenser.Delete()
+
+			case "split":
+				extensions = dispenser.RemainingArgs()
+				dispenser.Delete()
+				for range extensions {
+					dispenser.Delete()
+				}
+				if len(extensions) == 0 {
+					return nil, dispenser.ArgErr()
+				}
+
+			case "env":
+				args := dispenser.RemainingArgs()
+				dispenser.Delete()
+				for range args {
+					dispenser.Delete()
+				}
+				if len(args) != 2 {
+					return nil, dispenser.ArgErr()
+				}
+				if fcgiTransport.EnvVars == nil {
+					fcgiTransport.EnvVars = make(map[string]string)
+				}
+				fcgiTransport.EnvVars[args[0]] = args[1]
+
+			case "index":
+				args := dispenser.RemainingArgs()
+				dispenser.Delete()
+				for range args {
+					dispenser.Delete()
+				}
+				if len(args) != 1 {
+					return nil, dispenser.ArgErr()
+				}
+				indexFile = args[0]
+
+			case "resolve_root_symlink":
+				args := dispenser.RemainingArgs()
+				dispenser.Delete()
+				for range args {
+					dispenser.Delete()
+				}
+				fcgiTransport.ResolveRootSymlink = true
+
+			case "dial_timeout":
+				if !dispenser.NextArg() {
+					return nil, dispenser.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(dispenser.Val())
+				if err != nil {
+					return nil, dispenser.Errf("bad timeout value %s: %v", dispenser.Val(), err)
+				}
+				fcgiTransport.DialTimeout = caddy.Duration(dur)
+				dispenser.Delete()
+				dispenser.Delete()
+
+			case "read_timeout":
+				if !dispenser.NextArg() {
+					return nil, dispenser.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(dispenser.Val())
+				if err != nil {
+					return nil, dispenser.Errf("bad timeout value %s: %v", dispenser.Val(), err)
+				}
+				fcgiTransport.ReadTimeout = caddy.Duration(dur)
+				dispenser.Delete()
+				dispenser.Delete()
+
+			case "write_timeout":
+				if !dispenser.NextArg() {
+					return nil, dispenser.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(dispenser.Val())
+				if err != nil {
+					return nil, dispenser.Errf("bad timeout value %s: %v", dispenser.Val(), err)
+				}
+				fcgiTransport.WriteTimeout = caddy.Duration(dur)
+				dispenser.Delete()
+				dispenser.Delete()
+			}
+		}
+	}
+
+	// reset the dispenser after we're done so that the reverse_proxy
+	// unmarshaler can read it from the start
+	dispenser.Reset()
+
+	// set up a route list that we'll append to
+	routes := caddyhttp.RouteList{}
+
+	// set the list of allowed path segments on which to split
+	fcgiTransport.SplitPath = extensions
+
+	// if the index is turned off, we skip the redirect and try_files
+	if indexFile != "off" {
+		// route to redirect to canonical path if index PHP file
+		redirMatcherSet := caddy.ModuleMap{
+			"file": h.JSON(fileserver.MatchFile{
+				TryFiles: []string{"{http.request.uri.path}/" + indexFile},
+			}),
+			"not": h.JSON(caddyhttp.MatchNot{
+				MatcherSetsRaw: []caddy.ModuleMap{
+					{
+						"path": h.JSON(caddyhttp.MatchPath{"*/"}),
+					},
+				},
+			}),
+		}
+		redirHandler := caddyhttp.StaticResponse{
+			StatusCode: caddyhttp.WeakString(strconv.Itoa(http.StatusPermanentRedirect)),
+			Headers:    http.Header{"Location": []string{"{http.request.uri.path}/"}},
+		}
+		redirRoute := caddyhttp.Route{
+			MatcherSetsRaw: []caddy.ModuleMap{redirMatcherSet},
+			HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(redirHandler, "handler", "static_response", nil)},
+		}
+
+		// route to rewrite to PHP index file
+		rewriteMatcherSet := caddy.ModuleMap{
+			"file": h.JSON(fileserver.MatchFile{
+				TryFiles:  []string{"{http.request.uri.path}", "{http.request.uri.path}/" + indexFile, indexFile},
+				SplitPath: extensions,
+			}),
+		}
+		rewriteHandler := rewrite.Rewrite{
+			URI: "{http.matchers.file.relative}",
+		}
+		rewriteRoute := caddyhttp.Route{
+			MatcherSetsRaw: []caddy.ModuleMap{rewriteMatcherSet},
+			HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(rewriteHandler, "handler", "rewrite", nil)},
+		}
+
+		routes = append(routes, redirRoute, rewriteRoute)
+	}
+
+	// route to actually reverse proxy requests to PHP files;
+	// match only requests that are for PHP files
+	pathList := []string{}
+	for _, ext := range extensions {
+		pathList = append(pathList, "*"+ext)
+	}
+	rpMatcherSet := caddy.ModuleMap{
+		"path": h.JSON(pathList),
+	}
 
 	// create the reverse proxy handler which uses our FastCGI transport
 	rpHandler := &reverseproxy.Handler{
@@ -187,7 +353,9 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 
 	// the rest of the config is specified by the user
 	// using the reverse_proxy directive syntax
-	err = rpHandler.UnmarshalCaddyfile(h.Dispenser)
+	// TODO: this can overwrite our fcgiTransport that we encoded and
+	// set on the rpHandler... even with a non-fastcgi transport!
+	err = rpHandler.UnmarshalCaddyfile(dispenser)
 	if err != nil {
 		return nil, err
 	}
@@ -199,12 +367,13 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 		HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(rpHandler, "handler", "reverse_proxy", nil)},
 	}
 
+	subroute := caddyhttp.Subroute{
+		Routes: append(routes, rpRoute),
+	}
+
 	// the user's matcher is a prerequisite for ours, so
 	// wrap ours in a subroute and return that
-	if hasUserMatcher {
-		subroute := caddyhttp.Subroute{
-			Routes: caddyhttp.RouteList{redirRoute, rewriteRoute, rpRoute},
-		}
+	if userMatcherSet != nil {
 		return []httpcaddyfile.ConfigValue{
 			{
 				Class: "route",
@@ -216,20 +385,14 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 		}, nil
 	}
 
-	// if the user did not specify a matcher, then
-	// we can just use our own matchers
+	// otherwise, return the literal subroute instead of
+	// individual routes, to ensure they stay together and
+	// are treated as a single unit, without necessarily
+	// creating an actual subroute in the output
 	return []httpcaddyfile.ConfigValue{
 		{
 			Class: "route",
-			Value: redirRoute,
-		},
-		{
-			Class: "route",
-			Value: rewriteRoute,
-		},
-		{
-			Class: "route",
-			Value: rpRoute,
+			Value: subroute,
 		},
 	}, nil
 }

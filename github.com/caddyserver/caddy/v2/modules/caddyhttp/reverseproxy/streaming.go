@@ -13,25 +13,29 @@
 // limitations under the License.
 
 // Most of the code in this file was initially borrowed from the Go
-// standard library, which has this copyright notice:
-// Copyright 2011 The Go Authors.
+// standard library and modified; It had this copyright notice:
+// Copyright 2011 The Go Authors
 
 package reverseproxy
 
 import (
 	"context"
 	"io"
+	"mime"
 	"net/http"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
 	if reqUpType != resUpType {
-		// TODO: figure out our own error handling
-		// p.getErrorHandler()(rw, req, fmt.Errorf("backend tried to switch protocol %q when %q was requested", resUpType, reqUpType))
+		h.logger.Debug("backend tried to switch to unexpected protocol via Upgrade header",
+			zap.String("backend_upgrade", resUpType),
+			zap.String("requested_upgrade", reqUpType))
 		return
 	}
 
@@ -39,28 +43,41 @@ func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request
 
 	hj, ok := rw.(http.Hijacker)
 	if !ok {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("can't switch protocols using non-Hijacker ResponseWriter type %T", rw))
+		h.logger.Sugar().Errorf("can't switch protocols using non-Hijacker ResponseWriter type %T", rw)
 		return
 	}
 	backConn, ok := res.Body.(io.ReadWriteCloser)
 	if !ok {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("internal error: 101 switching protocols response with non-writable body"))
+		h.logger.Error("internal error: 101 switching protocols response with non-writable body")
 		return
 	}
-	defer backConn.Close()
+
+	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
+	backConnCloseCh := make(chan struct{})
+	go func() {
+		// Ensure that the cancelation of a request closes the backend.
+		// See issue https://golang.org/issue/35559.
+		select {
+		case <-req.Context().Done():
+		case <-backConnCloseCh:
+		}
+		backConn.Close()
+	}()
+	defer close(backConnCloseCh)
+
 	conn, brw, err := hj.Hijack()
 	if err != nil {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("Hijack failed on protocol switch: %v", err))
+		h.logger.Error("Hijack failed on protocol switch", zap.Error(err))
 		return
 	}
 	defer conn.Close()
 	res.Body = nil // so res.Write only writes the headers; we have res.Body in backConn above
 	if err := res.Write(brw); err != nil {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("response write: %v", err))
+		h.logger.Debug("response write", zap.Error(err))
 		return
 	}
 	if err := brw.Flush(); err != nil {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("response flush: %v", err))
+		h.logger.Debug("response flush", zap.Error(err))
 		return
 	}
 	errc := make(chan error, 1)
@@ -68,22 +85,45 @@ func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
 	<-errc
-	return
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
 // overriding its value for a specific request/response.
 func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Duration {
-	resCT := res.Header.Get("Content-Type")
+	resCTHeader := res.Header.Get("Content-Type")
+	resCT, _, err := mime.ParseMediaType(resCTHeader)
 
 	// For Server-Sent Events responses, flush immediately.
 	// The MIME type is defined in https://www.w3.org/TR/eventsource/#text-event-stream
-	if resCT == "text/event-stream" {
+	if err == nil && resCT == "text/event-stream" {
 		return -1 // negative means immediately
 	}
 
-	// TODO: more specific cases? e.g. res.ContentLength == -1? (this TODO is from the std lib)
+	// for h2 and h2c upstream streaming data to client (issues #3556 and #3606)
+	if h.isBidirectionalStream(req, res) {
+		return -1
+	}
+
+	// TODO: more specific cases? e.g. res.ContentLength == -1? (this TODO is from the std lib, but
+	// strangely similar to our isBidirectionalStream function that we implemented ourselves)
 	return time.Duration(h.FlushInterval)
+}
+
+// isBidirectionalStream returns whether we should work in bi-directional stream mode.
+//
+// See https://github.com/caddyserver/caddy/pull/3620 for discussion of nuances.
+func (h Handler) isBidirectionalStream(req *http.Request, res *http.Response) bool {
+	// We have to check the encoding here; only flush headers with identity encoding.
+	// Non-identity encoding might combine with "encode" directive, and in that case,
+	// if body size larger than enc.MinLength, upper level encode handle might have
+	// Content-Encoding header to write.
+	// (see https://github.com/caddyserver/caddy/issues/3606 for use case)
+	ae := req.Header.Get("Accept-Encoding")
+
+	return req.ProtoMajor == 2 &&
+		res.ProtoMajor == 2 &&
+		res.ContentLength == -1 &&
+		(ae == "identity" || ae == "")
 }
 
 func (h Handler) copyResponse(dst io.Writer, src io.Reader, flushInterval time.Duration) error {
@@ -98,20 +138,9 @@ func (h Handler) copyResponse(dst io.Writer, src io.Reader, flushInterval time.D
 		}
 	}
 
-	// TODO: Figure out how we want to do this... using custom buffer pool type seems unnecessary
-	// or maybe it is, depending on how we want to handle errors,
-	// see: https://github.com/golang/go/issues/21814
-	// buf := bufPool.Get().(*bytes.Buffer)
-	// buf.Reset()
-	// defer bufPool.Put(buf)
-	// _, err := io.CopyBuffer(dst, src, )
-	var buf []byte
-	// if h.BufferPool != nil {
-	// 	buf = h.BufferPool.Get()
-	// 	defer h.BufferPool.Put(buf)
-	// }
-	// // we could also see about a pool that returns values like this: make([]byte, 32*1024)
-	_, err := h.copyBuffer(dst, src, buf)
+	buf := streamingBufPool.Get().(*[]byte)
+	defer streamingBufPool.Put(buf)
+	_, err := h.copyBuffer(dst, src, *buf)
 	return err
 }
 
@@ -119,7 +148,7 @@ func (h Handler) copyResponse(dst io.Writer, src io.Reader, flushInterval time.D
 // of bytes written.
 func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 	if len(buf) == 0 {
-		buf = make([]byte, 32*1024)
+		buf = make([]byte, defaultBufferSize)
 	}
 	var written int64
 	for {
@@ -132,6 +161,7 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, er
 			// something we need to report to the client, but read errors are a problem on our
 			// end for sure. so we need to decide what we want.)
 			// p.logf("copyBuffer: ReverseProxy read error during body copy: %v", rerr)
+			h.logger.Error("reading from backend", zap.Error(rerr))
 		}
 		if nr > 0 {
 			nw, werr := dst.Write(buf[:nr])
@@ -222,3 +252,16 @@ func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.Copy(c.backend, c.user)
 	errc <- err
 }
+
+var streamingBufPool = sync.Pool{
+	New: func() interface{} {
+		// The Pool's New function should generally only return pointer
+		// types, since a pointer can be put into the return interface
+		// value without an allocation
+		// - (from the package docs)
+		b := make([]byte, defaultBufferSize)
+		return &b
+	},
+}
+
+const defaultBufferSize = 32 * 1024
